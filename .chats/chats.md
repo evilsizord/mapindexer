@@ -1,4 +1,12 @@
-I want to create a massive database of maps (levels) for the game Urban terror. The database should have keywords describing each map, and should have the author of the map and screenshots of each map. Is there a way to use AI to somehow generate that database from the map files?
+# AI Agent Conversations
+
+Below is a selection of some relevent AI chats used in this project. 
+
+https://chatgpt.com/share/69697f02-215c-8009-a2ce-fcfae2fc14de
+
+---
+
+> I want to create a massive database of maps (levels) for the game Urban terror. The database should have keywords describing each map, and should have the author of the map and screenshots of each map. Is there a way to use AI to somehow generate that database from the map files?
 
 Yes — you *can* use AI to generate most of that database automatically from Urban Terror map files, but it will work best as a **hybrid pipeline** (deterministic extraction + AI enrichment), not “AI-only.”
 
@@ -227,7 +235,7 @@ Just tell me how deep you want to go.
 
 ---
 
-Design the exact extraction script
+> Design the exact extraction script
 
 Below is an **exact, end-to-end extraction script design** you can actually implement. I’ll give you:
 
