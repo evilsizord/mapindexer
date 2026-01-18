@@ -9,8 +9,6 @@ from lib.bsp import analyze_bsp
 
 load_dotenv()
 
-RAW = Path(os.getenv("MAPS_RAW_DIR"))
-OUT = Path(os.getenv("MAPS_OUT_DIR"))
 db_path = os.getenv("MAPINDEXER_DB")
 
 if not db_path:
