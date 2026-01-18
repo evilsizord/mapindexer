@@ -36,4 +36,5 @@ At the end we should have a database with:
  - consider upgrading to qwen3
  - sqlite is probably not scalable, what is replacement?
  - bsp_tools does not work at all like the ai thought. Needs a lot of rework for geometry extraction
+ - should use ORM. Prism?
 
