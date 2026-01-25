@@ -5,7 +5,7 @@ from pathlib import Path
 import json
 from dotenv import load_dotenv
 import sqlite3
-from lib.bsp import analyze_bsp
+from mylib.bsp import analyze_bsp
 
 load_dotenv()
 

@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 from dotenv import load_dotenv
-from lib.camera import extract_cameras
+from mylib.camera import extract_cameras
 import sqlite3
 
 load_dotenv()
