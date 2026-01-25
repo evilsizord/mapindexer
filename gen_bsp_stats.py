@@ -5,7 +5,7 @@ from pathlib import Path
 import json
 from dotenv import load_dotenv
 import sqlite3
-from mapindexer.bsp import analyze_bsp
+from mapindexer.bsp_stats import analyze_bsp
 import traceback
 
 load_dotenv()
@@ -62,7 +62,7 @@ def main():
 
 def add_to_database(file_name, stats):
     try:
-        # Check if entry already exists
+        # Check if entry already exists (should have been created during PK3 extraction)
         # todo idk if this necessary. Maybe just let it fail if UPDATE fails?
         cursor = dbconn.execute(
             "SELECT id FROM Maps WHERE file_name = ?",

@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 import os
 from pathlib import Path
@@ -8,14 +9,12 @@ from dataclasses import dataclass
 from typing import Iterable, Optional, Tuple
 from itertools import combinations
 from typing import List, Tuple, Optional
+from bsp_helpers import intersect_3_planes, point_inside_planes, is_junk_shader, is_clip_shader, is_solid_shader
 
-
-Vec3 = Tuple[float, float, float]
 
 # -----------------------------
 # Tunable heuristics
 # -----------------------------
-
 MIN_LEAF_VOLUME = 128 * 128 * 128   # ignore tiny spaces (vents, trims)
 MIN_ROOM_LEAFS = 3                 # cluster must contain >= N leafs
 VERTICALITY_NORMALIZER = 4096.0    # typical Q3 vertical span
@@ -275,8 +274,6 @@ def compute_world_vertex_bounds(models, faces, vertices, textures):
     return tuple(mins), tuple(maxs)
 
 
-Vec3 = Tuple[float, float, float]
-
 def compute_leaf_occupancy_bounds(leafs):
     """
     Compute a leaf-based AABB intended to approximate "spatial occupancy".
@@ -332,76 +329,9 @@ def compute_leaf_occupancy_bounds(leafs):
 
 
 
-
-CONTENTS_SOLID     = 0x00000001
-CONTENTS_PLAYERCLIP= 0x00010000  # commonly used in Q3-derived games (value used in many toolchains)
-CONTENTS_BODY      = 0x02000000  # sometimes present
-
-
-
-
-def dot(a,b) -> float:
-    return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]
-
-def sub(a,b):
-    return (a[0]-b[0], a[1]-b[1], a[2]-b[2])
-
-def cross(a,b):
-    return (
-        a[1]*b[2] - a[2]*b[1],
-        a[2]*b[0] - a[0]*b[2],
-        a[0]*b[1] - a[1]*b[0],
-    )
-
-def add(a,b):
-    return (a[0]+b[0], a[1]+b[1], a[2]+b[2])
-
-def mul(a,s):
-    return (a[0]*s, a[1]*s, a[2]*s)
-
-def plane_eval(normal, dist, p):
-    # plane equation: dot(n, p) - dist
-    return dot(normal, p) - dist
-
-
-def intersect_3_planes(n1, d1: float, n2, d2: float, n3, d3: float, eps: float = 1e-6):
-    # Using formula: p = (d1*(n2×n3) + d2*(n3×n1) + d3*(n1×n2)) / (n1·(n2×n3))
-    n2xn3 = cross(n2, n3)
-    denom = dot(n1, n2xn3)
-    if abs(denom) < eps:
-        return None
-
-    term1 = mul(n2xn3, d1)
-    term2 = mul(cross(n3, n1), d2)
-    term3 = mul(cross(n1, n2), d3)
-    p = mul(add(add(term1, term2), term3), 1.0 / denom)
-    return p
-
-
-
-def point_inside_planes(p, planes, eps: float = 0.02):
-    # Inside means dot(n,p) - dist <= eps for all planes
-    for n, d in planes:
-        if plane_eval(n, d, p) > eps:
-            return False
-    return True
-
-def is_junk_shader(name: str) -> bool:
-    n = str(name).lower()
-    # These frequently create huge bounds and aren't "playable envelope"
-    return (
-        "trigger" in n or
-        "hint" in n or
-        "skip" in n or
-        "areaportal" in n or
-        "portal" in n or
-        "fog" in n
-    )
-
 def compute_collision_bounds_from_brushes(brushes, brushSides, planes, textures, *,
                                          include_solid: bool = True,
                                          include_playerclip: bool = True,
-                                         use_shader_name_for_clip: bool = True,
                                          eps_inside: float = 0.02):
     """
     Computes an AABB by converting selected brushes (solid / playerclip) into vertices
@@ -413,38 +343,30 @@ def compute_collision_bounds_from_brushes(brushes, brushSides, planes, textures,
     maxs = [float("-inf"), float("-inf"), float("-inf")]
     used = 0
 
-    def is_clip_shader(name: str) -> bool:
-        n = str(name).lower()
-        return n in ("common/clip", "common/playerclip") # todo  is this complete list?
-        #return ("playerclip" in n) or (n.endswith("/clip")) or ("/clip" in n)
-
     for bi, b in enumerate(brushes):
         if b.num_sides is None or b.num_sides <= 3:
             continue
 
         # Decide whether to a include this brush based on contents OR shader name
         tex_idx = b.texture
-        shader_name = textures[tex_idx].name if 0 <= tex_idx < len(textures) else ""
-        contents = textures[tex_idx].flags[1] if 0 <= tex_idx < len(textures) else 0
+        tex = textures[tex_idx] if 0 <= tex_idx < len(textures) else None
+
+        #shader_name = textures[tex_idx].name if 0 <= tex_idx < len(textures) else ""
+        #contents = textures[tex_idx].flags[1] if 0 <= tex_idx < len(textures) else 0
 
         include = False
-        if include_solid and (contents & CONTENTS_SOLID):
+        if include_solid and is_solid_shader(tex): #todo errr handling. Would shader be None?
             include = True
 
-        # Playerclip in UrT is often expressed via shader name even if contents flags are odd
         if not include and include_playerclip:
-            if use_shader_name_for_clip and shader_name and is_clip_shader(shader_name):
+            if tex and is_clip_shader(tex):
                 include = True
-            else:
-                # If your toolchain provides CONTENTS_PLAYERCLIP reliably, you can use it:
-                if contents & CONTENTS_PLAYERCLIP:
-                    include = True
 
         if not include:
             continue
 
         # Exclude common non-playable/junk volumes, but DO NOT exclude clip/playerclip
-        if shader_name and is_junk_shader(shader_name) and not is_clip_shader(shader_name):
+        if tex and is_junk_shader(tex) and not is_clip_shader(tex):
             continue
 
         # Collect this brush's planes
