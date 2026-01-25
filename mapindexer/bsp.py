@@ -1,3 +1,4 @@
+from __future__ import annotations
 import os
 from pathlib import Path
 import json
@@ -7,6 +8,7 @@ from dataclasses import dataclass
 from typing import Iterable, Optional, Tuple
 from itertools import combinations
 from typing import List, Tuple, Optional
+
 
 Vec3 = Tuple[float, float, float]
 
@@ -384,6 +386,17 @@ def point_inside_planes(p, planes, eps: float = 0.02):
             return False
     return True
 
+def is_junk_shader(name: str) -> bool:
+    n = str(name).lower()
+    # These frequently create huge bounds and aren't "playable envelope"
+    return (
+        "trigger" in n or
+        "hint" in n or
+        "skip" in n or
+        "areaportal" in n or
+        "portal" in n or
+        "fog" in n
+    )
 
 def compute_collision_bounds_from_brushes(brushes, brushSides, planes, textures, *,
                                          include_solid: bool = True,
@@ -401,17 +414,18 @@ def compute_collision_bounds_from_brushes(brushes, brushSides, planes, textures,
     used = 0
 
     def is_clip_shader(name: str) -> bool:
-        n = name.lower()
-        return ("playerclip" in n) or (n.endswith("/clip")) or ("/clip" in n)
+        n = str(name).lower()
+        return n in ("common/clip", "common/playerclip") # todo  is this complete list?
+        #return ("playerclip" in n) or (n.endswith("/clip")) or ("/clip" in n)
 
     for bi, b in enumerate(brushes):
-        if b.numSides <= 3:
+        if b.num_sides is None or b.num_sides <= 3:
             continue
 
         # Decide whether to a include this brush based on contents OR shader name
-        tex_idx = b.textureIndex
+        tex_idx = b.texture
         shader_name = textures[tex_idx].name if 0 <= tex_idx < len(textures) else ""
-        contents = textures[tex_idx].contentsFlags if 0 <= tex_idx < len(textures) else 0
+        contents = textures[tex_idx].flags[1] if 0 <= tex_idx < len(textures) else 0
 
         include = False
         if include_solid and (contents & CONTENTS_SOLID):
@@ -429,12 +443,16 @@ def compute_collision_bounds_from_brushes(brushes, brushSides, planes, textures,
         if not include:
             continue
 
+        # Exclude common non-playable/junk volumes, but DO NOT exclude clip/playerclip
+        if shader_name and is_junk_shader(shader_name) and not is_clip_shader(shader_name):
+            continue
+
         # Collect this brush's planes
         brush_plane_list = []
-        for si in range(b.firstSide, b.firstSide + b.numSides):
-            ps = brushSides[si].planeIndex
+        for si in range(b.first_side, b.first_side + b.num_sides):
+            ps = brushSides[si].plane
             pl = planes[ps]
-            brush_plane_list.append((pl.normal, pl.dist))
+            brush_plane_list.append((pl.normal, pl.distance))
 
         # Enumerate candidate vertices from all 3-plane intersections
         verts= []

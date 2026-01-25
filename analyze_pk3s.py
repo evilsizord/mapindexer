@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from mylib.extract_pk3 import extract_pk3
+from mapindexer.extract_pk3 import extract_pk3
 from dotenv import load_dotenv
 import sqlite3
 

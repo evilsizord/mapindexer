@@ -5,7 +5,8 @@ from pathlib import Path
 import json
 from dotenv import load_dotenv
 import sqlite3
-from mylib.bsp import analyze_bsp
+from mapindexer.bsp import analyze_bsp
+import traceback
 
 load_dotenv()
 
@@ -38,6 +39,7 @@ def main():
             print(json.dumps(stats, indent=2))
         except Exception as e:
             print(f"Failed to analyze {path.name}: {e}")
+            traceback.print_exc()
             sys.exit(1)
     
     elif path.is_dir():
