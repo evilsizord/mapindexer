@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 import os
 from pathlib import Path
@@ -6,10 +5,10 @@ import json
 import numpy as np
 from bsp_tool import load_bsp
 from dataclasses import dataclass
-from typing import Iterable, Optional, Tuple
+from typing import Dict, List, Iterable, Optional, Tuple, Set
 from itertools import combinations
-from typing import List, Tuple, Optional
-from bsp_helpers import intersect_3_planes, point_inside_planes, is_junk_shader, is_clip_shader, is_solid_shader
+from bsp_helpers import Vec3, intersect_3_planes, point_inside_planes, is_junk_shader, is_clip_shader, is_solid_shader
+from bsp_tool.branches.id_software.quake3 import Leaf, Plane, Node, Brush, BrushSide, Texture
 
 
 # -----------------------------
@@ -348,11 +347,9 @@ def compute_collision_bounds_from_brushes(brushes, brushSides, planes, textures,
             continue
 
         # Decide whether to a include this brush based on contents OR shader name
+        # todo: couldn't a brush have multiple textures..?
         tex_idx = b.texture
         tex = textures[tex_idx] if 0 <= tex_idx < len(textures) else None
-
-        #shader_name = textures[tex_idx].name if 0 <= tex_idx < len(textures) else ""
-        #contents = textures[tex_idx].flags[1] if 0 <= tex_idx < len(textures) else 0
 
         include = False
         if include_solid and is_solid_shader(tex): #todo errr handling. Would shader be None?
@@ -404,4 +401,263 @@ def compute_collision_bounds_from_brushes(brushes, brushSides, planes, textures,
 
     return (mins[0], mins[1], mins[2]), (maxs[0], maxs[1], maxs[2]), used
 
+
+
+def parse_origin(origin_str: str) -> Optional[Vec3]:
+    try:
+        parts = origin_str.replace(",", " ").split()
+        if len(parts) != 3:
+            return None
+        return (float(parts[0]), float(parts[1]), float(parts[2]))
+    except Exception:
+        return None
+    
+
+def pick_spawn_origin(ents) -> Optional[Vec3]:
+    """
+    Tries common UrT/Q3 spawn entity classnames in priority order.
+    Returns the first valid origin found.
+    """
+    spawn_classnames = [
+        "info_ut_spawn",              # UrT commonly
+        "info_player_deathmatch",     # Q3 / many mods
+        "info_player_start",
+        "info_player_team1",
+        "info_player_team2",
+    ]
+
+    # first pass: preferred classnames
+    for cn in spawn_classnames:
+        for e in ents:
+            if e.get("classname", "").lower() == cn.lower():
+                o = parse_origin(e.get("origin", ""))
+                if o is not None:
+                    return o
+
+    # fallback: any entity with an origin
+    for e in ents:
+        o = parse_origin(e.get("origin", ""))
+        if o is not None:
+            return o
+
+    return None
+
+
+
+# ----------------------------
+# BSP traversal: point -> leaf
+# ----------------------------
+
+def point_to_leaf_index(
+    point: Vec3,
+    nodes: List[Node],
+    leafs: List[Leaf],
+    planes: List[Plane],
+    root_node_index: int = 0,
+) -> int:
+    """
+    Traverse BSP nodes to find the leaf containing 'point'.
+    In Quake3, root is node 0.
+    Node children: >=0 = node index, <0 = leaf index encoded as -child - 1.
+    """
+    idx = root_node_index
+    while True:
+        if idx < 0:
+            leaf_index = -idx - 1
+            if 0 <= leaf_index < len(leafs):
+                return leaf_index
+            raise RuntimeError(f"Invalid leaf index computed: {leaf_index}")
+
+        node = nodes[idx]
+        plane = planes[node.planeIndex]
+        d = (plane.normal[0] * point[0] +
+             plane.normal[1] * point[1] +
+             plane.normal[2] * point[2]) - plane.dist
+
+        # front if d >= 0, back otherwise (standard Q3 convention)
+        idx = node.children[0] if d >= 0 else node.children[1]
+
+
+
+# ----------------------------
+# VIS/PVS: seed cluster -> visible clusters
+# ----------------------------
+
+# def pvs_clusters_for_seed(vis: Optional[VisData], seed_cluster: int) -> Set[int]:
+#     """
+#     Returns the set of clusters visible from seed_cluster, using the PVS bitset.
+#     If VIS is missing/unusable, fall back to "all clusters" (less strict).
+#     """
+#     if vis is None or vis.numClusters <= 0 or vis.bytesPerCluster <= 0:
+#         return set()  # signal "unknown"
+
+#     if seed_cluster < 0 or seed_cluster >= vis.numClusters:
+#         return set()
+
+#     bpc = vis.bytesPerCluster
+#     start = seed_cluster * bpc
+#     end = start + bpc
+#     if end > len(vis.bitsets):
+#         return set()
+
+#     bits = vis.bitsets[start:end]
+#     visible: Set[int] = set()
+#     for cluster in range(vis.numClusters):
+#         byte_i = cluster // 8
+#         bit_i = cluster % 8
+#         if byte_i >= len(bits):
+#             break
+#         if (bits[byte_i] >> bit_i) & 1:
+#             visible.add(cluster)
+#     # Typically a cluster can "see itself"; but even if not set, include it.
+#     visible.add(seed_cluster)
+#     return visible
+
+
+
+def brush_vertices(
+    brush: Brush,
+    brushSides: List[BrushSide],
+    planes: List[Plane],
+    eps_inside: float = 0.02,
+) -> List[Vec3]:
+    plane_list: List[Tuple[Vec3, float]] = []
+    s0 = int(brush.firstSide)
+    s1 = s0 + int(brush.num_sides)
+    for si in range(s0, s1):
+        pl = planes[int(brushSides[si].plane)]
+        plane_list.append((tuple(pl.normal), float(pl.distance)))
+
+    verts: List[Vec3] = []
+    for (n1, d1), (n2, d2), (n3, d3) in combinations(plane_list, 3):
+        p = intersect_3_planes(n1, d1, n2, d2, n3, d3)
+        if p is None:
+            continue
+        if point_inside_planes(p, plane_list, eps=eps_inside):
+            verts.append(p)
+    return verts
+
+
+
+def compute_playable_bounds_spawn_seeded(
+    *,
+    entities_text: str,
+    nodes: List[Node],
+    leafs: List[Leaf],
+    planes: List[Plane],
+    #vis: Optional[VisData],
+    leafBrushes: List[int],
+    brushes: List[Brush],
+    brushSides: List[BrushSide],
+    textures: List[Texture],
+    include_common_playerclip: bool = True,
+    eps_inside: float = 0.02,
+) -> Tuple[Vec3, Vec3, Dict[str, int]]:
+    """
+    Returns collision-based playable bounds seeded from a spawn point, restricted by PVS clusters.
+
+    Includes brushes that are:
+      - SOLID (contentsFlags & CONTENTS_SOLID)
+      - OR shader name == common/clip (and optionally common/playerclip)
+
+    Only considers brushes referenced by leafs whose cluster is visible in the seed cluster PVS.
+    """
+
+    # 1) Choose seed point
+    seed = pick_spawn_origin(entities_text)
+    if seed is None:
+        raise RuntimeError("Could not find a spawn origin in Entities lump to seed bounds.")
+
+    # 2) Find leaf containing seed
+    seed_leaf = point_to_leaf_index(seed, nodes, leafs, planes)
+    seed_cluster = leafs[seed_leaf].cluster
+    if seed_cluster < 0:
+        # Seed ended up in solid/outside; bounds will be unreliable.
+        raise RuntimeError(f"Seed point is in a leaf with cluster={seed_cluster} (likely solid/outside). Try a different seed.")
+
+    # 3) Determine visible clusters from seed cluster
+    #visible = pvs_clusters_for_seed(vis, seed_cluster)
+    have_pvs = False
+
+    # 4) Collect brushes from leafs in visible clusters
+    CLIP_NAMES = {"common/clip"}
+    if include_common_playerclip:
+        CLIP_NAMES.add("common/playerclip")
+
+    def tex_name(idx: int) -> str:
+        if 0 <= idx < len(textures):
+            return (textures[idx].name or "").lower()
+        return ""
+
+    def tex_contents(idx: int) -> int:
+        if 0 <= idx < len(textures):
+            return int(textures[idx].contentsFlags)
+        return 0
+
+    brush_indices: Set[int] = set()
+    leafs_considered = 0
+
+    for lf in leafs:
+        c = lf.cluster
+        if c < 0:
+            continue
+        #if have_pvs and c not in visible:
+        #    continue
+
+        leafs_considered += 1
+        lb0 = int(lf.first_leaf_brush)
+        lb1 = lb0 + int(lf.num_leaf_brushes)
+        for i in range(lb0, lb1):
+            if 0 <= i < len(leafBrushes):
+                bi = int(leafBrushes[i])
+                if 0 <= bi < len(brushes):
+                    brush_indices.add(bi)
+
+    # 5) Build bounds from included brush vertices
+    mins = [float("inf"), float("inf"), float("inf")]
+    maxs = [float("-inf"), float("-inf"), float("-inf")]
+    included_brushes = 0
+
+    for bi in brush_indices:
+        b = brushes[bi]
+        if int(b.num_sides) <= 3:
+            continue
+
+        t = int(b.texture)
+        tex = textures[t] if 0 <= t < len(textures) else None
+        #name = tex_name(t)
+        #cflags = tex_contents(t)
+
+        include = is_solid_shader(tex) or is_clip_shader(tex)
+        if not include:
+            continue
+
+        verts = brush_vertices(b, brushSides, planes, eps_inside=eps_inside)
+        if not verts:
+            continue
+
+        for x, y, z in verts:
+            if x < mins[0]: mins[0] = x
+            if y < mins[1]: mins[1] = y
+            if z < mins[2]: mins[2] = z
+            if x > maxs[0]: maxs[0] = x
+            if y > maxs[1]: maxs[1] = y
+            if z > maxs[2]: maxs[2] = z
+
+        included_brushes += 1
+
+    if included_brushes == 0 or mins[0] == float("inf"):
+        raise RuntimeError("No SOLID/common-clip brushes included after PVS filtering. Check VIS, entities seed, or parsing.")
+
+    stats = {
+        "seed_leaf": seed_leaf,
+        "seed_cluster": seed_cluster,
+        "have_pvs": 1 if have_pvs else 0,
+        #"visible_clusters": len(visible) if have_pvs else 0,
+        "leafs_considered": leafs_considered,
+        "candidate_brushes": len(brush_indices),
+        "included_brushes": included_brushes,
+    }
+
+    return (mins[0], mins[1], mins[2]), (maxs[0], maxs[1], maxs[2]), stats
 

@@ -2,6 +2,9 @@ from pathlib import Path
 import numpy as np
 from math import atan2, degrees
 from bsp_tool import load_bsp
+from itertools import combinations
+from collections import defaultdict, deque
+from mapindexer.bsp_helpers import CONTENTS_SOLID, is_clip_shader, is_solid_shader
 
 """
 ::Chat GPT::
@@ -260,6 +263,189 @@ def make_camera(cam_type, pos, yaw, pitch):
         "angles": (round(yaw, 1), round(pitch, 1))
     }
 
+
+
+## -----------------------------------
+# try a different approach...
+## -----------------------------------
+
+
+def aabb_touch(a_min, a_max, b_min, b_max, eps=1.0):
+    # True if AABBs overlap or touch within eps on all axes
+    return np.all(a_min <= b_max + eps) and np.all(b_min <= a_max + eps)
+
+def spatial_hash(aabb_mins, aabb_maxs, cell=512.0):
+    # Returns dict cell_key -> list of indices
+    grid = defaultdict(list)
+    for i, (mn, mx) in enumerate(zip(aabb_mins, aabb_maxs)):
+        c0 = np.floor(mn / cell).astype(int)
+        c1 = np.floor(mx / cell).astype(int)
+        for x in range(c0[0], c1[0] + 1):
+            for y in range(c0[1], c1[1] + 1):
+                for z in range(c0[2], c1[2] + 1):
+                    grid[(x, y, z)].append(i)
+    return grid
+
+def connected_components_from_aabbs(aabb_mins, aabb_maxs, eps=1.0, cell=512.0):
+    grid = spatial_hash(aabb_mins, aabb_maxs, cell=cell)
+
+    # Build adjacency lazily using the spatial hash
+    n = len(aabb_mins)
+    visited = np.zeros(n, dtype=bool)
+    components = []
+
+    # Precompute each brush's occupied cells for quick neighbor retrieval
+    brush_cells = []
+    for mn, mx in zip(aabb_mins, aabb_maxs):
+        c0 = np.floor(mn / cell).astype(int)
+        c1 = np.floor(mx / cell).astype(int)
+        cells = []
+        for x in range(c0[0], c1[0] + 1):
+            for y in range(c0[1], c1[1] + 1):
+                for z in range(c0[2], c1[2] + 1):
+                    cells.append((x, y, z))
+        brush_cells.append(cells)
+
+    for start in range(n):
+        if visited[start]:
+            continue
+        q = deque([start])
+        visited[start] = True
+        comp = []
+
+        while q:
+            i = q.popleft()
+            comp.append(i)
+
+            # Candidate neighbors: brushes in any shared cell
+            candidates = set()
+            for ck in brush_cells[i]:
+                candidates.update(grid[ck])
+
+            for j in candidates:
+                if visited[j] or j == i:
+                    continue
+                if aabb_touch(aabb_mins[i], aabb_maxs[i], aabb_mins[j], aabb_maxs[j], eps=eps):
+                    visited[j] = True
+                    q.append(j)
+
+        components.append(comp)
+
+    return components
+
+def component_aabbs(aabb_mins, aabb_maxs, components):
+    out = []
+    for comp in components:
+        mn = np.min(aabb_mins[comp], axis=0)
+        mx = np.max(aabb_maxs[comp], axis=0)
+        out.append((mn, mx, len(comp)))
+    return out
+
+def plane_triplet_intersection(n1, d1, n2, d2, n3, d3, det_eps=1e-8):
+    """
+    Solve:
+      n1·x = d1
+      n2·x = d2
+      n3·x = d3
+    Returns x or None if planes are nearly parallel / singular.
+    """
+    A = np.stack([n1, n2, n3], axis=0).astype(np.float64)
+    b = np.array([d1, d2, d3], dtype=np.float64)
+    det = np.linalg.det(A)
+    if abs(det) < det_eps:
+        return None
+    return np.linalg.solve(A, b)
+
+def point_inside_all_planes(x, normals, distances, eps=0.25):
+    """
+    Inside test for halfspaces:
+      n·x <= d + eps
+    """
+    a = np.all((normals @ x) <= (distances + eps))
+    b = np.all((normals @ x) >= (distances - eps))
+    # Return both; caller can decide, but usually only one will be true consistently
+    return a, b
+
+def brush_aabb_from_planes(bsp, brush, *, inside_eps=0.25, det_eps=1e-8):
+    """
+    Returns (mins, maxs) for the convex brush, or None if degenerate/unresolved.
+    """
+    # Collect planes for this brush
+    sides = bsp.BRUSH_SIDES[brush.first_side : brush.first_side + brush.num_sides]
+    planes = [bsp.PLANES[side.plane] for side in sides]
+
+    normals = np.array([[p.normal.x, p.normal.y, p.normal.z] for p in planes], dtype=np.float64)
+    distances = np.array([p.distance for p in planes], dtype=np.float64)
+
+    # Enumerate all plane triplets -> candidate vertices
+    pts_le, pts_ge = [], []
+
+    for i, j, k in combinations(range(len(planes)), 3):
+        n1, d1 = normals[i], distances[i]
+        n2, d2 = normals[j], distances[j]
+        n3, d3 = normals[k], distances[k]
+        x = plane_triplet_intersection(n1, d1, n2, d2, n3, d3, det_eps=det_eps)
+        if x is None:
+            continue
+        inside_le, inside_ge = point_inside_all_planes(x, normals, distances, eps=inside_eps)
+        if inside_le: pts_le.append(x)
+        if inside_ge: pts_ge.append(x)
+
+    pts = pts_le if len(pts_le) >= len(pts_ge) else pts_ge
+
+    if not pts:
+        return None  # degenerate brush or wrong inside inequality for this BSP
+
+    P = np.stack(pts, axis=0)
+    mins = P.min(axis=0)
+    maxs = P.max(axis=0)
+    return mins, maxs
+
+
+def is_clip_shader(shader) -> bool:
+    #n = str(shader.name).lower() #todo need to trim?
+    name = shader.name.decode("utf-8", errors="ignore") if isinstance(shader.name, (bytes, bytearray)) else str(shader.name)
+    name = name.lower().strip()
+    # Playerclip in UrT is often expressed via shader name instead of contents flag
+    return name in ("common/clip", "common/playerclip") # todo  is this complete list?
+    #return ("playerclip" in n) or (n.endswith("/clip")) or ("/clip" in n)
+
+def is_solid_shader(shader) -> bool:
+    return shader.flags[1] & CONTENTS_SOLID
+
+
+
+def collect_playerclip_aabbs(bsp):
+    mins_list = []
+    maxs_list = []
+    brush_indices = []
+
+    for bi, brush in enumerate(bsp.BRUSHES):
+        if not is_clip_shader(bsp.TEXTURES[brush.texture]) and not is_solid_shader(bsp.TEXTURES[brush.texture]):
+            continue
+
+        aabb = brush_aabb_from_planes(bsp, brush)
+        if aabb is None:
+            continue
+
+        mn, mx = aabb
+        mins_list.append(mn)
+        maxs_list.append(mx)
+        brush_indices.append(bi)
+
+    mins_arr = np.array(mins_list, dtype=np.float64).reshape((-1, 3))
+    maxs_arr = np.array(maxs_list, dtype=np.float64).reshape((-1, 3))
+
+    return mins_arr, maxs_arr, brush_indices
+
+
+
+
+
+
+
+
+
 # ----------------------------
 # Main entry point
 # ----------------------------
@@ -283,13 +469,26 @@ def extract_cameras(bsp_path, num_cameras=1):
     # flag points
     # models (points of interest)
 
+    mins_arr, maxs_arr, brush_ids = collect_playerclip_aabbs(bsp)
+
+    components = connected_components_from_aabbs(mins_arr, maxs_arr, eps=2.0, cell=512.0)
+    section_aabbs = component_aabbs(mins_arr, maxs_arr, components)
+
+    # section_aabbs = [(mins, maxs, num_brushes_in_section), ...]
+    # Optionally sort by volume descending:
+    section_aabbs.sort(key=lambda t: float(np.prod(t[1]-t[0])), reverse=True)
+
+    #debug - print some section stats
+    print("Playerclip sections: ", len(section_aabbs))
+    for i, (mn, mx, count) in enumerate(section_aabbs):
+        vol = np.prod(mx - mn)
+        print(f"Section {i}: brushes={count}, volume={vol}, mins={mn}, maxs={mx}")
+
+
     #debug - print some leaf stats
-    print(f"Total leafs: {len(bsp.LEAVES)}, Significant leafs: {len(leafs)}, Clusters: {len(clusters)}")
-    print(f"leaf1 min: {leafs[0]['mins']}, max: {leafs[0]['maxs']}")
-    print(f"leaf2 min: {leafs[1]['mins']}, max: {leafs[1]['maxs']}")
-    print(f"leaf3 min: {leafs[2]['mins']}, max: {leafs[2]['maxs']}")
-    print(f"leaf4 min: {leafs[3]['mins']}, max: {leafs[3]['maxs']}")
-    print(f"leaf5 min: {leafs[4]['mins']}, max: {leafs[4]['maxs']}")
+    #print(f"Total leafs: {len(bsp.LEAVES)}, Significant leafs: {len(leafs)}, Clusters: {len(clusters)}")
+    #print(f"leaf1 min: {leafs[0]['mins']}, max: {leafs[0]['maxs']}")
+
 
     overview = select_overview_camera(leafs, map_center, world_bounds, all_leafs, num_cameras)
     combat = select_combat_camera(clusters, leafs, world_bounds, all_leafs, num_cameras)
@@ -309,46 +508,3 @@ def extract_cameras(bsp_path, num_cameras=1):
     return cameras
 
 
-
-"""
-Example Output:
-[
-  {
-    "type": "overview",
-    "pos": [512.0, -128.0, 384.0],
-    "angles": [135.0, -12.0]
-  },
-  {
-    "type": "combat",
-    "pos": [-64.0, 256.0, 192.0],
-    "angles": [0.0, -15.0]
-  },
-  {
-    "type": "sightline",
-    "pos": [-1024.0, 512.0, 256.0],
-    "angles": [45.0, -8.0]
-  },
-  {
-    "type": "vertical",
-    "pos": [128.0, -512.0, 448.0],
-    "angles": [0.0, 75.0]
-  }
-]
-
-
-Usage in auto_cam.cfg:
-
-    cg_draw2D 0
-    cg_drawGun 0
-    cg_thirdPerson 1
-    r_fov 95
-
-    viewpos 512 -128 384 135
-    wait 40
-    screenshotJPEG
-
-    viewpos -64 256 192 0
-    wait 40
-    screenshotJPEG
-
-"""
