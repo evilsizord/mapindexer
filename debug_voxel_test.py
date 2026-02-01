@@ -195,6 +195,7 @@ def build_spatial_hash(aabb_mins, aabb_maxs, cell=1024.0):
                     grid[(x, y, z)].append(i)
     return grid
 
+## currently unused
 def query_cell_candidates(grid, point, cell=512.0, neighbor_radius=0):
     c = tuple(np.floor(point / cell).astype(int))
     if neighbor_radius == 0:
@@ -335,7 +336,7 @@ def find_floor_z(x, y, z_top, z_bottom, *, blocked_fn, coarse_step=256.0, refine
 
 
 # ---------------------------
-# 2D grid sampling -> nodes -> flood fill -> AABBs
+# 3D grid sampling -> nodes -> flood fill -> AABBs
 # ---------------------------
 
 def compute_playable_sections_2p5d(bsp, *, xy_step=96.0, stand_height=48.0,
@@ -389,30 +390,36 @@ def compute_playable_sections_2p5d(bsp, *, xy_step=96.0, stand_height=48.0,
     nodes_z = np.full((nx, ny), np.nan, dtype=np.float32)
     valid = np.zeros((nx, ny), dtype=np.uint8)
 
+    #debug
+    temp_z = np.full((nx, ny), np.nan, dtype=np.float32)
+
     z_top = float(world_maxs[2])
     z_bottom = float(world_mins[2])
 
-    for ix in range(nx):
-        x = float(world_mins[0] + (ix + 0.5) * xy_step)
-        for iy in range(ny):
-            y = float(world_mins[1] + (iy + 0.5) * xy_step)
-            floor_z = find_floor_z(
-                x, y, z_top, z_bottom,
-                blocked_fn=blocked_fn,
-                coarse_step=floor_coarse_step,
-                refine_step=floor_refine_step,
-            )
-            if floor_z is None:
-                continue
-            z_stand = floor_z + stand_height
+    # for ix in range(nx):
+    #     x = float(world_mins[0] + (ix + 0.5) * xy_step)
+    #     for iy in range(ny):
+    #         y = float(world_mins[1] + (iy + 0.5) * xy_step)
+    #         #todo - find_floor_z is failing for a lot of spawn nodes, what is happening
+    #         floor_z = find_floor_z(
+    #             x, y, z_top, z_bottom,
+    #             blocked_fn=blocked_fn,
+    #             coarse_step=floor_coarse_step,
+    #             refine_step=floor_refine_step,
+    #         )
+    #         if floor_z is None:
+    #             continue
+    #         z_stand = floor_z + stand_height
 
-            # sanity: stand point should be in air
-            p_stand = np.array([x, y, z_stand], dtype=np.float32)
-            if not has_clearance(p_stand, blocked_fn, player_height=64.0): 
-                continue
+    #         temp_z[ix, iy] = z_stand  #debug
 
-            nodes_z[ix, iy] = z_stand
-            valid[ix, iy] = 1
+    #         # sanity: stand point should be in air
+    #         p_stand = np.array([x, y, z_stand], dtype=np.float32)
+    #         if not has_clearance(p_stand, blocked_fn, player_height=64.0): 
+    #             continue
+
+    #         nodes_z[ix, iy] = z_stand
+    #         valid[ix, iy] = 1
 
 
     #NEW
@@ -426,10 +433,16 @@ def compute_playable_sections_2p5d(bsp, *, xy_step=96.0, stand_height=48.0,
         if cell is None:
             print("Spawn origin", o, "out of grid bounds")
             continue
+        # todo: for some reason snaapping fails even on some cells that should be valid. Seems like valid[] is incomplete.
+        
+        
+        
         snapped = nearest_valid_cell(cell[0], cell[1], valid, max_r=8)
         print("Spawn origin", o, "mapped to cell", cell, "snapped to", snapped)
         if snapped is not None:
             seed_cells.append(snapped)
+        else:
+            print("--> temp_z: ", temp_z[cell[0], cell[1]])
 
     #debug
     print("Using", len(seed_cells), "seed cells for flood fill")
@@ -586,9 +599,9 @@ def centroid(mins, maxs):
 
 sections = compute_playable_sections_2p5d(
     bsp,
-    xy_step=64.0,              # bigger = faster / coarser
+    xy_step=32.0,              # bigger = faster / coarser
     stand_height=48.0,         # approx player origin above floor
-    cell_size=512.0,          # spatial hash cell size
+    cell_size=32.0,          #512 # spatial hash cell size
     floor_coarse_step=128.0,   # coarse downward marching step
     floor_refine_step=16.0,    # refine near floor
     connect_step_height=80.0,  # allow stairs/ramps
