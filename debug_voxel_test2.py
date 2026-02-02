@@ -194,7 +194,7 @@ def is_blocked_point(point, grid, cell_size, aabb_mins, aabb_maxs, normals_list,
                 for dz in (-1, 0, 1):
                     key = (kx + dx, ky + dy, kz + dz)
                     if key in blocked_cache:
-                        print("blocked_cache hit:", key, "->", blocked_cache[key])
+                        #print("blocked_cache hit:", key, "->", blocked_cache[key])
                         return blocked_cache[key]
     else:
         # ensure local variables exist for potential store below
@@ -265,7 +265,7 @@ def find_floor_z(x, y, z_start, z_min, blocked_fn, *, coarse=128.0, refine=8.0):
     """
     z = z_start
     last_air = None
-    print("find_floor_z: x,y,z_start:", x, y, z_start, "z_min:", z_min)
+    #print("find_floor_z: x,y,z_start:", x, y, z_start, "z_min:", z_min)
 
     # march downward until we hit solid
     while z >= z_min:
@@ -295,7 +295,7 @@ def find_ceiling_z(x, y, z_start, z_max, blocked_fn, *, coarse=128.0, refine=8.0
     """
     z = z_start
     last_air = None
-    print("Find ceiling from z_start:", z_start, "to z_max:", z_max)
+    #print("Find ceiling from z_start:", z_start, "to z_max:", z_max)
 
     # march upward until we hit solid
     while z <= z_max:
@@ -481,8 +481,10 @@ def flood_fill_3d_from_spawns(bsp, blocked_fn, *,
             visited.add(state)
             q.append(state)
 
+    # note - the initial q/visited arrays are smaller than expected. But I think it might be because, depending on grid size, 
+    # you might have multiple spawns in the same cell, so they get de-duped.
     print("Initial reachable cells:", len(visited))
-    sys.exit(0)
+    #sys.exit(0)
 
     # 6-neighbor expansion in grid
     nbrs = [(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)]
@@ -493,6 +495,7 @@ def flood_fill_3d_from_spawns(bsp, blocked_fn, *,
         ix, iy, iz = q.popleft()
         c = cell_center(ix, iy, iz, world_mins, voxel)
         x0, y0, z_guess0 = float(c[0]), float(c[1]), float(c[2])
+        print("Evaluating cell:", (ix, iy, iz), "visited:", len(visited))
 
         # Snap current to get a stable z_guess for neighbors (optional but helps)
         z_current = snap_to_standing_z(
@@ -519,6 +522,7 @@ def flood_fill_3d_from_spawns(bsp, blocked_fn, *,
             # Neighbor z guess: keep close to current snapped z
             z_guess2 = z_current + dz * voxel
 
+            # todo optimize>? - we are calling this here when we add to q, but then again above when we pop and process q
             z2 = snap_to_standing_z(
                 x2, y2, z_guess2,
                 blocked_fn=blocked_fn,
@@ -631,3 +635,6 @@ print("reachable AABB:", aabb)
 ## exmaples:
 #blocked_cache hit: (2696, 1288, 141304992) -> False
 #blocked_cache hit: (2696, 1288, 141305024) -> False
+
+## ok the snap_to_standing() issue is resolved now, it had an infinite loop now fixed.
+# now need to continue a full test run see what hapen
