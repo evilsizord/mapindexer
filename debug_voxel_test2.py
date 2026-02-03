@@ -5,6 +5,8 @@ from math import atan2, degrees
 from bsp_tool import load_bsp
 from collections import deque, defaultdict
 from itertools import combinations
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
 
 ## In this version, trying a 3d grid sampling approach instead of 2.5d
 
@@ -445,7 +447,6 @@ def flood_fill_3d_from_spawns(bsp, blocked_fn, *,
         c = cell_center(ix, iy, iz, world_mins, voxel)
         x, y, z_guess = float(c[0]), float(c[1]), float(c[2])
 
-        # todo: snap_to_standing_z() taking way too long. even with cache still slow.
         # this is a little confusing - this actually checks that the player can stand at that location. And then gets the z.
         # also it gets a world z, not a cell z. which is confusing because snap makes it sound lik eit would return iz not z.
         z_cur = snap_to_standing_z_cached(
@@ -495,19 +496,31 @@ def flood_fill_3d_from_spawns(bsp, blocked_fn, *,
         ix, iy, iz = q.popleft()
         c = cell_center(ix, iy, iz, world_mins, voxel)
         x0, y0, z_guess0 = float(c[0]), float(c[1]), float(c[2])
-        print("Evaluating cell:", (ix, iy, iz), "visited:", len(visited))
+        #print("Evaluating cell:", (ix, iy, iz), "visited:", len(visited))
 
         # Snap current to get a stable z_guess for neighbors (optional but helps)
-        z_current = snap_to_standing_z(
-            x0, y0, z_guess0,
-            blocked_fn=blocked_fn,
-            z_min=float(world_mins[2]),
+        z_current = snap_to_standing_z_cached(
+            ix, iy, iz,
+            world_mins=world_mins, 
+            voxel=voxel, 
+            nz=nz,
+            blocked_fn=blocked_fn, 
+            z_min=float(world_mins[2]), 
             z_max=float(world_maxs[2]),
-            stand_height=stand_height,
-            player_height=player_height,
-            max_step_up=max_step_up,
-            max_step_down=max_step_down,
+            cache=snap_cache,
+            stand_height=stand_height, player_height=player_height,
+            max_step_up=max_step_up, max_step_down=max_step_down
         )
+        # z_current = snap_to_standing_z(
+        #     x0, y0, z_guess0,
+        #     blocked_fn=blocked_fn,
+        #     z_min=float(world_mins[2]),
+        #     z_max=float(world_maxs[2]),
+        #     stand_height=stand_height,
+        #     player_height=player_height,
+        #     max_step_up=max_step_up,
+        #     max_step_down=max_step_down,
+        # )
         if z_current is None:
             continue
 
@@ -523,16 +536,28 @@ def flood_fill_3d_from_spawns(bsp, blocked_fn, *,
             z_guess2 = z_current + dz * voxel
 
             # todo optimize>? - we are calling this here when we add to q, but then again above when we pop and process q
-            z2 = snap_to_standing_z(
-                x2, y2, z_guess2,
-                blocked_fn=blocked_fn,
-                z_min=float(world_mins[2]),
+            z2 = snap_to_standing_z_cached(
+                ix2, iy2, iz2,
+                world_mins=world_mins, 
+                voxel=voxel, 
+                nz=nz,
+                blocked_fn=blocked_fn, 
+                z_min=float(world_mins[2]), 
                 z_max=float(world_maxs[2]),
-                stand_height=stand_height,
-                player_height=player_height,
-                max_step_up=max_step_up,
-                max_step_down=max_step_down,
+                cache=snap_cache,
+                stand_height=stand_height, player_height=player_height,
+                max_step_up=max_step_up, max_step_down=max_step_down
             )
+            # z2 = snap_to_standing_z(
+            #     x2, y2, z_guess2,
+            #     blocked_fn=blocked_fn,
+            #     z_min=float(world_mins[2]),
+            #     z_max=float(world_maxs[2]),
+            #     stand_height=stand_height,
+            #     player_height=player_height,
+            #     max_step_up=max_step_up,
+            #     max_step_down=max_step_down,
+            # )
             if z2 is None:
                 continue
 
@@ -543,6 +568,7 @@ def flood_fill_3d_from_spawns(bsp, blocked_fn, *,
             st2 = (ix2, iy2, iz_snapped)
             if st2 in visited:
                 continue
+            #print("Adding reachable cell:", st2)
             visited.add(st2)
             q.append(st2)
 
@@ -554,7 +580,9 @@ def flood_fill_3d_from_spawns(bsp, blocked_fn, *,
     xs, ys, zs = [], [], []
     for (ix, iy, iz) in visited:
         p = cell_center(ix, iy, iz, world_mins, voxel)
-        xs.append(float(p[0])); ys.append(float(p[1])); zs.append(float(p[2]))
+        xs.append(float(p[0])); 
+        ys.append(float(p[1])); 
+        zs.append(float(p[2]))
 
     mn = np.array([min(xs) - half, min(ys) - half, min(zs) - half], dtype=np.float32)
     mx = np.array([max(xs) + half, max(ys) + half, max(zs) + half], dtype=np.float32)
@@ -621,9 +649,28 @@ visited, aabb = flood_fill_3d_from_spawns(
     max_step_down=64.0,
 )
 
+model0 = bsp.MODELS[0]
+world_mins = np.array(model0.bounds.mins, dtype=np.float32)
+
 print("reachable cells:", len(visited))
 print("reachable AABB:", aabb)
 
+vlist = list(visited)
+x,y,z = vlist[0]
+print("Example cell 1:", cell_center(x, y, z, world_mins, VOXEL))
+print("Example cell 31:", cell_center(vlist[30][0], vlist[30][1], vlist[30][2], world_mins, VOXEL))
+
+# 3d plot of visited
+fig = plt.figure()
+xs, ys, zs = [], [], []
+for (ix, iy, iz) in visited:
+    p = cell_center(ix, iy, iz, world_mins, VOXEL)
+    xs.append(float(p[0])); 
+    ys.append(float(p[1])); 
+    zs.append(float(p[2]))
+ax = fig.add_subplot(111, projection='3d')
+ax.scatter(xs, ys, zs, c='blue', marker='o')
+plt.show()
 
 
 ###
@@ -637,4 +684,7 @@ print("reachable AABB:", aabb)
 #blocked_cache hit: (2696, 1288, 141305024) -> False
 
 ## ok the snap_to_standing() issue is resolved now, it had an infinite loop now fixed.
-# now need to continue a full test run see what hapen
+
+# another issue - it is only finding reachable cells on the z=8 plane.
+# a) check is this map really all on the 8 plane? -- YEAH I GUESS THE SPAWNS ARE.
+# b) also the snap_to_standing_z() function is probably limiting z movement. We want to allow all valid z values.
