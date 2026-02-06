@@ -1,6 +1,16 @@
 from pathlib import Path
 import sys
+import time
+import os
 import numpy as np
+# Allow forcing Numba off via environment variable `MAPINDEXER_NO_NUMBA=1`
+_NUMBA_AVAILABLE = False
+if os.environ.get("MAPINDEXER_NO_NUMBA", "0") != "1":
+    try:
+        from numba import njit
+        _NUMBA_AVAILABLE = True
+    except Exception:
+        _NUMBA_AVAILABLE = False
 from math import atan2, degrees
 from bsp_tool import load_bsp
 from collections import deque, defaultdict
@@ -84,10 +94,36 @@ def point_in_convex_brush(point, normals, distances, eps=0.25):
     Robust to plane orientation: treat inside as whichever inequality fits better.
     For most Q3 BSPs, one of these will consistently work.
     """
+    # If Numba is available, use the compiled implementation which is faster
+    if _NUMBA_AVAILABLE:
+        return _point_in_convex_brush_numba(point.astype(np.float32), normals.astype(np.float32), distances.astype(np.float32), float(eps))
+
     v = normals @ point
     inside_le = np.all(v <= distances + eps)
     inside_ge = np.all(v >= distances - eps)
     return inside_le or inside_ge
+
+# Numba gives small savings in the blocked function time but overall runtime difference is small (~0.16s).. :-/
+if _NUMBA_AVAILABLE:
+    @njit
+    def _point_in_convex_brush_numba(point, normals, distances, eps):
+        m = normals.shape[0]
+        # compute v = normals @ point for each plane
+        inside_le = True
+        for i in range(m):
+            v = normals[i, 0] * point[0] + normals[i, 1] * point[1] + normals[i, 2] * point[2]
+            if not (v <= distances[i] + eps):
+                inside_le = False
+                break
+
+        inside_ge = True
+        for i in range(m):
+            v = normals[i, 0] * point[0] + normals[i, 1] * point[1] + normals[i, 2] * point[2]
+            if not (v >= distances[i] - eps):
+                inside_ge = False
+                break
+
+        return inside_le or inside_ge
 
 def plane_triplet_intersection(n1, d1, n2, d2, n3, d3, det_eps=1e-8):
     A = np.stack([n1, n2, n3], axis=0).astype(np.float64)
@@ -150,25 +186,6 @@ def point_inside_any(point, brush_set):
             return True
     return False
 
-def is_playable_point(point, solid_brushes, playerclip_brushes=None):
-    # Must not be inside solid
-    if point_inside_any(point, solid_brushes):
-        return False
-    # If you have playerclip, require being inside it (optional)
-    if playerclip_brushes is not None and len(playerclip_brushes) > 0:
-        if not point_inside_any(point, playerclip_brushes):
-            return False
-    return True
-
-def is_air_point(point, blocking_brushes):
-    return not point_inside_any(point, blocking_brushes)
-
-def is_walkable_point(point, blocking_brushes, support_step=32.0):
-    if not is_air_point(point, blocking_brushes):
-        return False
-    below = point - np.array([0.0, 0.0, support_step], dtype=np.float64)
-    return point_inside_any(below, blocking_brushes)
-
 def query_candidates(grid, point, cell=1024.0):
     c = tuple(np.floor(point / cell).astype(int))
     return grid.get(c, [])
@@ -191,6 +208,7 @@ def is_blocked_point(point, grid, cell_size, aabb_mins, aabb_maxs, normals_list,
         ky = int(round(py / cache_eps))
         kz = int(round(pz / cache_eps))
         # check neighbors within one bin to allow variance
+        # todo - is this necessary or efficient? or accurate? checks 26 neighbor bins right?
         for dx in (-1, 0, 1):
             for dy in (-1, 0, 1):
                 for dz in (-1, 0, 1):
@@ -291,17 +309,23 @@ def find_floor_z(x, y, z_start, z_min, blocked_fn, *, coarse=128.0, refine=8.0):
     while z >= z_min:
         p = np.array([x, y, z], dtype=np.float32)
         if blocked_fn(p):
-            # refine upward to find boundary
-            z2 = z
+            # refine using binary search between blocked z (z) and last known air
+            lo = z
+            hi = (last_air if last_air is not None else z_start)
+            # if hi is below lo, return lo
+            if hi < lo:
+                return lo
             best = None
-            # stop refining when we reach the last known air level (or the original start)
-            upper = (last_air if last_air is not None else z_start)
-            while z2 <= upper:
-                p2 = np.array([x, y, z2], dtype=np.float32)
+            # binary refine until desired precision
+            while (hi - lo) > refine:
+                mid = (lo + hi) * 0.5
+                p2 = np.array([x, y, mid], dtype=np.float32)
                 if blocked_fn(p2):
-                    best = z2
-                z2 += refine
-            return best
+                    lo = mid
+                else:
+                    hi = mid
+            # lo is approx highest blocked
+            return lo
         last_air = z
         z -= coarse
 
@@ -321,17 +345,21 @@ def find_ceiling_z(x, y, z_start, z_max, blocked_fn, *, coarse=128.0, refine=8.0
     while z <= z_max:
         p = np.array([x, y, z], dtype=np.float32)
         if blocked_fn(p):
-            # refine downward to find boundary
-            z2 = z
-            best = None
-            # stop refining when we reach the last known air level (or the original start)
-            lower = (last_air if last_air is not None else z_start)
-            while z2 >= lower:
-                p2 = np.array([x, y, z2], dtype=np.float32)
+            # refine using binary search between last known air (below) and blocked z (z)
+            lo = (last_air if last_air is not None else z_start)
+            hi = z
+            if hi < lo:
+                return hi
+            # binary refine until desired precision
+            while (hi - lo) > refine:
+                mid = (lo + hi) * 0.5
+                p2 = np.array([x, y, mid], dtype=np.float32)
                 if blocked_fn(p2):
-                    best = z2
-                z2 -= refine
-            return best
+                    hi = mid
+                else:
+                    lo = mid
+            # hi is approx lowest blocked
+            return hi
         last_air = z
         z += coarse
 
@@ -461,6 +489,7 @@ def flood_fill_3d_from_spawns(bsp, blocked_fn, *,
       visited: set of (ix,iy,iz) reachable standing cells
       aabb: (mins, maxs) of visited points (in world space, expanded by half voxel)
     """
+    start_time = time.perf_counter()
 
     model0 = bsp.MODELS[0]
     world_mins = np.array(model0.bounds.mins, dtype=np.float32)
@@ -624,12 +653,16 @@ def flood_fill_3d_from_spawns(bsp, blocked_fn, *,
     xs, ys, zs = [], [], []
     for (ix, iy, iz) in visited:
         p = cell_center(ix, iy, iz, world_mins, voxel)
-        xs.append(float(p[0])); 
-        ys.append(float(p[1])); 
+        xs.append(float(p[0]))
+        ys.append(float(p[1]))
         zs.append(float(p[2]))
 
     mn = np.array([min(xs) - half, min(ys) - half, min(zs) - half], dtype=np.float32)
     mx = np.array([max(xs) + half, max(ys) + half, max(zs) + half], dtype=np.float32)
+    
+    elapsed = time.perf_counter() - start_time
+    print(f"flood_fill_3d_from_spawns completed in {elapsed:.2f} seconds")
+    
     return visited, (mn, mx)
 
 
@@ -669,10 +702,21 @@ def make_blocked_fn(bsp):
 
     # Cache for is_blocked_point results. Keys are quantized bins (kx,ky,kz) -> bool
     blocked_cache = {}
-    cache_eps = 0.25
+    # Use a coarser cache epsilon (in world units) to increase reuse across nearby probes
+    cache_eps = max(0.25, VOXEL / 8.0)  # e.g. 8.0 for VOXEL=64
+
+    # lightweight stats for profiling call counts and cumulative time
+    stats = {"calls": 0, "time": 0.0}
 
     def blocked_fn(p):
-        return is_blocked_point(p, grid, VOXEL, aabb_mins, aabb_maxs, normals_list, dists_list, eps=cache_eps, blocked_cache=blocked_cache, cache_eps=cache_eps)
+        stats["calls"] += 1
+        t0 = time.perf_counter()
+        res = is_blocked_point(p, grid, VOXEL, aabb_mins, aabb_maxs, normals_list, dists_list, eps=cache_eps, blocked_cache=blocked_cache, cache_eps=cache_eps)
+        stats["time"] += (time.perf_counter() - t0)
+        return res
+
+    # attach stats object to the function for external inspection
+    blocked_fn._stats = stats
 
     return blocked_fn
 
@@ -736,3 +780,7 @@ plt.show()
 # i think next step is, we need a has_floor_and_ceiling() function, and spearate that logic from snap_to_standing_z()
 # snap_to_standing_z() probably only needed for spawns? Then for neighbor cell exploration use has_floor_and_ceiling()?
 
+# ok latest update - now it is finding reachable cells across multiple z planes, which is good. 
+# it is kinda slow but finnishes about 6s for avg map, maybe ok.
+# definitely needs cleanup and further analysis.
+# next step now is probably placing cameras.
