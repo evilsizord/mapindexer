@@ -229,17 +229,35 @@ def tex_name(bsp, tex_index):
     return t.name.decode("utf-8", errors="ignore").lower() if isinstance(t.name, (bytes, bytearray)) else str(t.name).lower()
 
 def is_playerclip(bsp, brush):
-    name = tex_name(bsp, brush.texture)
-    return ("playerclip" in name) or (name.endswith("/clip")) or ("common/clip" in name)
+    """
+    Check if a brush is playerclip by examining all its sides.
+    Returns True if ANY side has a playerclip texture.
+    """
+    for side_idx in range(brush.first_side, brush.first_side + brush.num_sides):
+        side = bsp.BRUSH_SIDES[side_idx]
+        name = tex_name(bsp, side.texture)
+        if ("playerclip" in name) or (name.endswith("/clip")) or ("common/clip" in name):
+            return True
+    return False
 
 def is_solid_world(bsp, brush):
-    # This is the part you may need to adapt based on your Contents flags.
-    # As a fallback, treat "nodraw" etc. as not solid; but best is contents flags.
-    name = tex_name(bsp, brush.texture)
-    if "playerclip" in name or "weapclip" in name:
-        return False
-    # Many real solids are regular textures; avoid excluding too much.
-    return bool(bsp.TEXTURES[brush.texture].flags[1] & CONTENTS_SOLID)
+    """
+    Check if brush is world solid by examining all its sides.
+    Excludes playerclip and weapclip brushes.
+    Returns True if ANY side has CONTENTS_SOLID and no side is clip.
+    """
+    # First check: exclude clip brushes
+    for side_idx in range(brush.first_side, brush.first_side + brush.num_sides):
+        side = bsp.BRUSH_SIDES[side_idx]
+        name = tex_name(bsp, side.texture)
+        if "playerclip" in name or "weapclip" in name or "clip" in name:
+            return False
+    # Check if any side is solid
+    for side_idx in range(brush.first_side, brush.first_side + brush.num_sides):
+        side = bsp.BRUSH_SIDES[side_idx]
+        if bsp.TEXTURES[side.texture].flags[1] & CONTENTS_SOLID:
+            return True
+    return False
 
 
 # -------------------------
@@ -318,6 +336,29 @@ def find_ceiling_z(x, y, z_start, z_max, blocked_fn, *, coarse=128.0, refine=8.0
         z += coarse
 
     return None
+
+
+
+def has_floor_and_ceiling(x, y, z, blocked_fn, z_min, z_max, stand_height=48.0, player_height=72.0, eps=1.0):
+    floor = find_floor_z(x, y, z, z_min, blocked_fn, coarse=6.0, refine=2.0)
+    if floor is None:
+        return False
+
+    z_origin = floor + stand_height
+
+    # Must be air at origin and at head
+    p_origin = np.array([x, y, z_origin], dtype=np.float32)
+    p_head   = np.array([x, y, floor + player_height], dtype=np.float32)
+    if blocked_fn(p_origin) or blocked_fn(p_head):
+        return False
+
+    # Ceiling constraint: ceiling must be above head
+    ceil = find_ceiling_z(x, y, z_origin, z_max, blocked_fn, coarse=6.0, refine=2.0)
+    if ceil is not None and ceil <= z_origin + player_height + eps:
+        return False
+
+    return True
+
 
 
 def snap_to_standing_z(x, y, z_guess, *,
@@ -439,7 +480,7 @@ def flood_fill_3d_from_spawns(bsp, blocked_fn, *,
 
     # Seed initialization: snap each spawn to a standing z at its (x,y)
     for s in seeds:
-        print("Processing seed:", s)
+        #print("Processing seed:", s)
         cell = world_to_cell(s, world_mins, voxel, nx, ny, nz)
         if cell is None:
             continue
@@ -495,33 +536,36 @@ def flood_fill_3d_from_spawns(bsp, blocked_fn, *,
     while q:
         ix, iy, iz = q.popleft()
         c = cell_center(ix, iy, iz, world_mins, voxel)
-        x0, y0, z_guess0 = float(c[0]), float(c[1]), float(c[2])
+        x0, y0, z0 = float(c[0]), float(c[1]), float(c[2])
         #print("Evaluating cell:", (ix, iy, iz), "visited:", len(visited))
 
         # Snap current to get a stable z_guess for neighbors (optional but helps)
-        z_current = snap_to_standing_z_cached(
-            ix, iy, iz,
-            world_mins=world_mins, 
-            voxel=voxel, 
-            nz=nz,
-            blocked_fn=blocked_fn, 
-            z_min=float(world_mins[2]), 
-            z_max=float(world_maxs[2]),
-            cache=snap_cache,
-            stand_height=stand_height, player_height=player_height,
-            max_step_up=max_step_up, max_step_down=max_step_down
-        )
-        # z_current = snap_to_standing_z(
-        #     x0, y0, z_guess0,
-        #     blocked_fn=blocked_fn,
-        #     z_min=float(world_mins[2]),
+        # z_current = snap_to_standing_z_cached(
+        #     ix, iy, iz,
+        #     world_mins=world_mins, 
+        #     voxel=voxel, 
+        #     nz=nz,
+        #     blocked_fn=blocked_fn, 
+        #     z_min=float(world_mins[2]), 
         #     z_max=float(world_maxs[2]),
-        #     stand_height=stand_height,
-        #     player_height=player_height,
-        #     max_step_up=max_step_up,
-        #     max_step_down=max_step_down,
+        #     cache=snap_cache,
+        #     stand_height=stand_height, player_height=player_height,
+        #     max_step_up=max_step_up, max_step_down=max_step_down
         # )
-        if z_current is None:
+        # # z_current = snap_to_standing_z(
+        # #     x0, y0, z_guess0,
+        # #     blocked_fn=blocked_fn,
+        # #     z_min=float(world_mins[2]),
+        # #     z_max=float(world_maxs[2]),
+        # #     stand_height=stand_height,
+        # #     player_height=player_height,
+        # #     max_step_up=max_step_up,
+        # #     max_step_down=max_step_down,
+        # # )
+        # if z_current is None:
+        #     continue
+
+        if not has_floor_and_ceiling(x0, y0, z0, blocked_fn, float(world_mins[2]), float(world_maxs[2]), stand_height=stand_height, player_height=player_height):
             continue
 
         for dx, dy, dz in nbrs:
@@ -529,25 +573,25 @@ def flood_fill_3d_from_spawns(bsp, blocked_fn, *,
             if not (0 <= ix2 < nx and 0 <= iy2 < ny and 0 <= iz2 < nz):
                 continue
 
-            c2 = cell_center(ix2, iy2, iz2, world_mins, voxel)
-            x2, y2 = float(c2[0]), float(c2[1])
+            #c2 = cell_center(ix2, iy2, iz2, world_mins, voxel)
+            #x2, y2 = float(c2[0]), float(c2[1])
 
             # Neighbor z guess: keep close to current snapped z
-            z_guess2 = z_current + dz * voxel
+            #z_guess2 = z0 + dz * voxel
 
             # todo optimize>? - we are calling this here when we add to q, but then again above when we pop and process q
-            z2 = snap_to_standing_z_cached(
-                ix2, iy2, iz2,
-                world_mins=world_mins, 
-                voxel=voxel, 
-                nz=nz,
-                blocked_fn=blocked_fn, 
-                z_min=float(world_mins[2]), 
-                z_max=float(world_maxs[2]),
-                cache=snap_cache,
-                stand_height=stand_height, player_height=player_height,
-                max_step_up=max_step_up, max_step_down=max_step_down
-            )
+            # z2 = snap_to_standing_z_cached(
+            #     ix2, iy2, iz2,
+            #     world_mins=world_mins, 
+            #     voxel=voxel, 
+            #     nz=nz,
+            #     blocked_fn=blocked_fn, 
+            #     z_min=float(world_mins[2]), 
+            #     z_max=float(world_maxs[2]),
+            #     cache=snap_cache,
+            #     stand_height=stand_height, player_height=player_height,
+            #     max_step_up=max_step_up, max_step_down=max_step_down
+            # )
             # z2 = snap_to_standing_z(
             #     x2, y2, z_guess2,
             #     blocked_fn=blocked_fn,
@@ -558,14 +602,14 @@ def flood_fill_3d_from_spawns(bsp, blocked_fn, *,
             #     max_step_up=max_step_up,
             #     max_step_down=max_step_down,
             # )
-            if z2 is None:
-                continue
+            # if z2 is None:
+            #     continue
 
-            iz_snapped = z_to_iz(z2, float(world_mins[2]), voxel, nz)
-            if iz_snapped is None:
-                continue
+            # iz_snapped = z_to_iz(z2, float(world_mins[2]), voxel, nz)
+            # if iz_snapped is None:
+            #     continue
 
-            st2 = (ix2, iy2, iz_snapped)
+            st2 = (ix2, iy2, iz2)
             if st2 in visited:
                 continue
             #print("Adding reachable cell:", st2)
@@ -658,7 +702,7 @@ print("reachable AABB:", aabb)
 vlist = list(visited)
 x,y,z = vlist[0]
 print("Example cell 1:", cell_center(x, y, z, world_mins, VOXEL))
-print("Example cell 31:", cell_center(vlist[30][0], vlist[30][1], vlist[30][2], world_mins, VOXEL))
+print("Example cell 18:", cell_center(vlist[18][0], vlist[18][1], vlist[18][2], world_mins, VOXEL))
 
 # 3d plot of visited
 fig = plt.figure()
@@ -688,3 +732,7 @@ plt.show()
 # another issue - it is only finding reachable cells on the z=8 plane.
 # a) check is this map really all on the 8 plane? -- YEAH I GUESS THE SPAWNS ARE.
 # b) also the snap_to_standing_z() function is probably limiting z movement. We want to allow all valid z values.
+
+# i think next step is, we need a has_floor_and_ceiling() function, and spearate that logic from snap_to_standing_z()
+# snap_to_standing_z() probably only needed for spawns? Then for neighbor cell exploration use has_floor_and_ceiling()?
+

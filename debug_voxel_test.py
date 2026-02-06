@@ -124,17 +124,35 @@ def tex_name(bsp, tex_index):
     return t.name.decode("utf-8", errors="ignore").lower() if isinstance(t.name, (bytes, bytearray)) else str(t.name).lower()
 
 def is_playerclip(bsp, brush):
-    name = tex_name(bsp, brush.texture)
-    return ("playerclip" in name) or (name.endswith("/clip")) or ("common/clip" in name)
+    """
+    Check if a brush is playerclip by examining all its sides.
+    Returns True if ANY side has a playerclip texture.
+    """
+    for side_idx in range(brush.first_side, brush.first_side + brush.num_sides):
+        side = bsp.BRUSH_SIDES[side_idx]
+        name = tex_name(bsp, side.texture)
+        if ("playerclip" in name) or (name.endswith("/clip")) or ("common/clip" in name):
+            return True
+    return False
 
 def is_solid_world(bsp, brush):
-    # This is the part you may need to adapt based on your Contents flags.
-    # As a fallback, treat "nodraw" etc. as not solid; but best is contents flags.
-    name = tex_name(bsp, brush.texture)
-    if "playerclip" in name or "weapclip" in name:
-        return False
-    # Many real solids are regular textures; avoid excluding too much.
-    return bool(bsp.TEXTURES[brush.texture].flags[1] & CONTENTS_SOLID)
+    """
+    Check if brush is world solid by examining all its sides.
+    Excludes playerclip and weapclip brushes.
+    Returns True if ANY side has CONTENTS_SOLID and no side is clip.
+    """
+    # First check: exclude clip brushes
+    for side_idx in range(brush.first_side, brush.first_side + brush.num_sides):
+        side = bsp.BRUSH_SIDES[side_idx]
+        name = tex_name(bsp, side.texture)
+        if "playerclip" in name or "weapclip" in name or "clip" in name:
+            return False
+    # Check if any side is solid
+    for side_idx in range(brush.first_side, brush.first_side + brush.num_sides):
+        side = bsp.BRUSH_SIDES[side_idx]
+        if bsp.TEXTURES[side.texture].flags[1] & CONTENTS_SOLID:
+            return True
+    return False
 
 def compile_brush_sets(bsp):
     solid = []
