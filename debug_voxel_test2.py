@@ -21,11 +21,11 @@ from mpl_toolkits.mplot3d import Axes3D
 ## In this version, trying a 3d grid sampling approach instead of 2.5d
 
 CONTENTS_SOLID     = 0x00000001
-VOXEL = 64.0            # grid resolution
+VOXEL = 32.0            # grid resolution
 STAND_HEIGHT = 48.0     # player origin above floor
 PLAYER_HEIGHT = 72.0    # standing clearance
 MAX_STEP_UP = 18.0      # normal step height
-MAX_STEP_DOWN = 64.0    # allow dropping off small ledges
+MAX_STEP_DOWN = 32.0    # allow dropping off small ledges
 
 
 
@@ -388,6 +388,38 @@ def has_floor_and_ceiling(x, y, z, blocked_fn, z_min, z_max, stand_height=48.0, 
     return True
 
 
+def has_floor_and_ceiling_cached(ix, iy, iz, *,
+                                 world_mins, voxel, nz,
+                                 blocked_fn, z_min, z_max,
+                                 cache: dict,
+                                 stand_height=48.0, player_height=72.0, eps=1.0):
+    """
+    Cached version of has_floor_and_ceiling. Uses a dict cache keyed by (ix, iy, iz).
+    """
+    key = (ix, iy, iz)
+    if key in cache:
+        return cache[key]
+
+    # Convert cell indices to world coords
+    c = cell_center(ix, iy, iz, world_mins, voxel)
+    x = float(c[0])
+    y = float(c[1])
+    z = float(c[2])
+
+    result = has_floor_and_ceiling(
+        x, y, z,
+        blocked_fn=blocked_fn,
+        z_min=z_min,
+        z_max=z_max,
+        stand_height=stand_height,
+        player_height=player_height,
+        eps=eps
+    )
+
+    cache[key] = result
+    return result
+
+
 
 def snap_to_standing_z(x, y, z_guess, *,
                        blocked_fn,
@@ -502,9 +534,9 @@ def flood_fill_3d_from_spawns(bsp, blocked_fn, *,
 
     seeds = get_spawn_origins(bsp)
     q = deque()
-    visited = set()
+    
+    seeds_visited = set()
     print("Seed spawns:", len(seeds))
-
     snap_cache = SnapCache(bucket_voxels=2)
 
     # Seed initialization: snap each spawn to a standing z at its (x,y)
@@ -548,20 +580,23 @@ def flood_fill_3d_from_spawns(bsp, blocked_fn, *,
             continue
 
         state = (ix, iy, iz0)
-        if state not in visited:
-            visited.add(state)
+        if state not in seeds_visited:
+            seeds_visited.add(state)
             q.append(state)
 
     # note - the initial q/visited arrays are smaller than expected. But I think it might be because, depending on grid size, 
     # you might have multiple spawns in the same cell, so they get de-duped.
-    print("Initial reachable cells:", len(visited))
+    print("Initial reachable cells:", len(seeds_visited))
     #sys.exit(0)
 
     # 6-neighbor expansion in grid
     nbrs = [(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)]
+    visited = set()
+    
+    # Cache for has_floor_and_ceiling results
+    floor_ceil_cache = {}
 
-    # todo: it seems like this loops over each spawn, and finds just the immediate neighbors? It should continue expanding.
-    # oh no wait, it is continually adding to q, so it does continue expanding.
+    # explore nodes in queue. Neighbor nodes are added and explored in turn, until queu is exhausted.
     while q:
         ix, iy, iz = q.popleft()
         c = cell_center(ix, iy, iz, world_mins, voxel)
@@ -594,9 +629,30 @@ def flood_fill_3d_from_spawns(bsp, blocked_fn, *,
         # if z_current is None:
         #     continue
 
-        if not has_floor_and_ceiling(x0, y0, z0, blocked_fn, float(world_mins[2]), float(world_maxs[2]), stand_height=stand_height, player_height=player_height):
+        if blocked_fn(np.array([x0, y0, z0], dtype=np.float32)):
             continue
 
+        if not has_floor_and_ceiling_cached(
+            ix, iy, iz,
+            world_mins=world_mins,
+            voxel=voxel,
+            nz=nz,
+            blocked_fn=blocked_fn,
+            z_min=float(world_mins[2]),
+            z_max=float(world_maxs[2]),
+            cache=floor_ceil_cache,
+            stand_height=stand_height,
+            player_height=player_height
+        ):
+            continue
+
+        st = (ix, iy, iz)
+        if st in visited:
+            continue
+        #print("Adding reachable cell:", st)
+        visited.add(st)
+
+        # add neighbors to explore queue
         for dx, dy, dz in nbrs:
             ix2, iy2, iz2 = ix + dx, iy + dy, iz + dz
             if not (0 <= ix2 < nx and 0 <= iy2 < ny and 0 <= iz2 < nz):
@@ -642,7 +698,7 @@ def flood_fill_3d_from_spawns(bsp, blocked_fn, *,
             if st2 in visited:
                 continue
             #print("Adding reachable cell:", st2)
-            visited.add(st2)
+            #visited.add(st2)
             q.append(st2)
 
     # Build AABB in world space
@@ -698,7 +754,7 @@ def make_blocked_fn(bsp):
     aabb_maxs = np.stack(aabb_maxs, axis=0)
 
     # 2) Spatial hash broadphase
-    grid = build_spatial_hash(aabb_mins, aabb_maxs, cell=VOXEL)
+    grid = build_spatial_hash(aabb_mins, aabb_maxs, cell=VOXEL*4)
 
     # Cache for is_blocked_point results. Keys are quantized bins (kx,ky,kz) -> bool
     blocked_cache = {}
@@ -711,7 +767,7 @@ def make_blocked_fn(bsp):
     def blocked_fn(p):
         stats["calls"] += 1
         t0 = time.perf_counter()
-        res = is_blocked_point(p, grid, VOXEL, aabb_mins, aabb_maxs, normals_list, dists_list, eps=cache_eps, blocked_cache=blocked_cache, cache_eps=cache_eps)
+        res = is_blocked_point(p, grid, VOXEL*4, aabb_mins, aabb_maxs, normals_list, dists_list, eps=cache_eps, blocked_cache=blocked_cache, cache_eps=cache_eps)
         stats["time"] += (time.perf_counter() - t0)
         return res
 
@@ -730,11 +786,11 @@ blocked_fn = make_blocked_fn(bsp)  # you implement using spatial hash + point-in
 # 2) Flood fill from spawns (3D, on-demand)
 visited, aabb = flood_fill_3d_from_spawns(
     bsp, blocked_fn,
-    voxel=64.0,
+    voxel=VOXEL,
     stand_height=48.0,
     player_height=72.0,
     max_step_up=18.0,
-    max_step_down=64.0,
+    max_step_down=32.0,
 )
 
 model0 = bsp.MODELS[0]
@@ -748,17 +804,28 @@ x,y,z = vlist[0]
 print("Example cell 1:", cell_center(x, y, z, world_mins, VOXEL))
 print("Example cell 18:", cell_center(vlist[18][0], vlist[18][1], vlist[18][2], world_mins, VOXEL))
 
+# cell with max z
+max_z_cell = max(visited, key=lambda c: c[2])
+print("Cell with max z:", max_z_cell, "world coords:", cell_center(max_z_cell[0], max_z_cell[1], max_z_cell[2], world_mins, VOXEL))
+# outside :( wall is -488-440=48. and z=536 is inside a ceiling which should be z=528 max.)
+
+# cell with min z
+min_z_cell = min(visited, key=lambda c: c[2])
+print("Cell with min z:", min_z_cell, "world coords:", cell_center(min_z_cell[0], min_z_cell[1], min_z_cell[2], world_mins, VOXEL))
+# hah this is a utility room for the map builder. There should be no way our flood fill discovered this.
+
+
 # 3d plot of visited
-fig = plt.figure()
-xs, ys, zs = [], [], []
-for (ix, iy, iz) in visited:
-    p = cell_center(ix, iy, iz, world_mins, VOXEL)
-    xs.append(float(p[0])); 
-    ys.append(float(p[1])); 
-    zs.append(float(p[2]))
-ax = fig.add_subplot(111, projection='3d')
-ax.scatter(xs, ys, zs, c='blue', marker='o')
-plt.show()
+# fig = plt.figure()
+# xs, ys, zs = [], [], []
+# for (ix, iy, iz) in visited:
+#     p = cell_center(ix, iy, iz, world_mins, VOXEL)
+#     xs.append(float(p[0])); 
+#     ys.append(float(p[1])); 
+#     zs.append(float(p[2]))
+# ax = fig.add_subplot(111, projection='3d')
+# ax.scatter(xs, ys, zs, c='blue', marker='o')
+# plt.show()
 
 
 ###
@@ -784,3 +851,8 @@ plt.show()
 # it is kinda slow but finnishes about 6s for avg map, maybe ok.
 # definitely needs cleanup and further analysis.
 # next step now is probably placing cameras.
+
+# ok nvm maybe not working good. Before it was rougly good cells but after checking max and min cells it was finding some outside the map.
+# so I tried making the voxel smaller, but still getting cells outside the playable map (current max is way outside).
+# so more work needed...
+
