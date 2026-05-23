@@ -2,6 +2,7 @@ from pathlib import Path
 import sys
 import time
 import os
+import random
 import numpy as np
 # Allow forcing Numba off via environment variable `MAPINDEXER_NO_NUMBA=1`
 _NUMBA_AVAILABLE = False
@@ -195,8 +196,7 @@ def is_blocked_point(point, grid, cell_size, aabb_mins, aabb_maxs, normals_list,
     """
     Test whether a point is inside any blocking brush. Optionally use `blocked_cache` to
     cache recent results. `cache_eps` controls the quantization radius used for cache keys
-    (defaults to `eps` if not provided). When checking the cache we search neighbor buckets
-    within +/-1 to allow an epsilon variance when matching.
+    (defaults to `eps` if not provided).
     """
     px, py, pz = float(point[0]), float(point[1]), float(point[2])
 
@@ -207,15 +207,9 @@ def is_blocked_point(point, grid, cell_size, aabb_mins, aabb_maxs, normals_list,
         kx = int(round(px / cache_eps))
         ky = int(round(py / cache_eps))
         kz = int(round(pz / cache_eps))
-        # check neighbors within one bin to allow variance
-        # todo - is this necessary or efficient? or accurate? checks 26 neighbor bins right?
-        for dx in (-1, 0, 1):
-            for dy in (-1, 0, 1):
-                for dz in (-1, 0, 1):
-                    key = (kx + dx, ky + dy, kz + dz)
-                    if key in blocked_cache:
-                        #print("blocked_cache hit:", key, "->", blocked_cache[key])
-                        return blocked_cache[key]
+        key = (kx, ky, kz)
+        if key in blocked_cache:
+            return blocked_cache[key]
     else:
         # ensure local variables exist for potential store below
         kx = ky = kz = None
@@ -364,6 +358,153 @@ def find_ceiling_z(x, y, z_start, z_max, blocked_fn, *, coarse=128.0, refine=8.0
         z += coarse
 
     return None
+
+
+def point_to_leaf_index(bsp, point):
+    """
+    Traverse the BSP tree and return the leaf containing point.
+    Q3 children use negative indexes encoded as -leaf_index - 1.
+    """
+    idx = 0
+    while idx >= 0:
+        node = bsp.NODES[idx]
+        plane = bsp.PLANES[node.plane]
+        d = (
+            plane.normal.x * float(point[0]) +
+            plane.normal.y * float(point[1]) +
+            plane.normal.z * float(point[2]) -
+            plane.distance
+        )
+        idx = node.children.front if d >= 0 else node.children.back
+
+    leaf_index = -idx - 1
+    if 0 <= leaf_index < len(bsp.LEAVES):
+        return leaf_index
+    return None
+
+
+def point_in_playable_leaf(bsp, point):
+    leaf_index = point_to_leaf_index(bsp, point)
+    return leaf_index is not None and bsp.LEAVES[leaf_index].cluster >= 0
+
+
+def has_standing_clearance(bsp, x, y, z_origin, *,
+                           blocked_fn, z_max,
+                           player_height=72.0, eps=1.0):
+    """
+    Validate a player origin: body/head are in air and in non-solid BSP leafs.
+    """
+    p_origin = np.array([x, y, z_origin], dtype=np.float32)
+    p_head = np.array([x, y, z_origin + player_height], dtype=np.float32)
+
+    if blocked_fn(p_origin) or blocked_fn(p_head):
+        return False
+    if not point_in_playable_leaf(bsp, p_origin):
+        return False
+    if not point_in_playable_leaf(bsp, p_head):
+        return False
+
+    ceil = find_ceiling_z(x, y, z_origin, z_max, blocked_fn, coarse=6.0, refine=2.0)
+    if ceil is not None and ceil <= z_origin + player_height + eps:
+        return False
+
+    return True
+
+
+def has_fly_clearance(bsp, point, *, blocked_fn, player_height=72.0):
+    """
+    Validate a player-origin point for fly/noclip-style reachability.
+    No floor is required; the origin, mid-body, and head must stay in air leafs.
+    """
+    p_origin = np.asarray(point, dtype=np.float32)
+    sample_offsets = (0.0, player_height * 0.5, player_height)
+
+    for dz in sample_offsets:
+        p = p_origin + np.array([0.0, 0.0, dz], dtype=np.float32)
+        if blocked_fn(p):
+            return False
+        if not point_in_playable_leaf(bsp, p):
+            return False
+
+    return True
+
+
+def can_fly_between(bsp, p0, p1, *,
+                    blocked_fn,
+                    player_height=72.0,
+                    sample_step=8.0):
+    """
+    Approximate a swept fly movement by sampling the player hull along a voxel edge.
+    """
+    p0 = np.asarray(p0, dtype=np.float32)
+    p1 = np.asarray(p1, dtype=np.float32)
+    dist = float(np.linalg.norm(p1 - p0))
+    steps = max(2, int(np.ceil(dist / sample_step)) + 1)
+
+    for i in range(steps + 1):
+        t = i / steps
+        p = p0 + (p1 - p0) * t
+        if not has_fly_clearance(
+            bsp, p,
+            blocked_fn=blocked_fn,
+            player_height=player_height,
+        ):
+            return False
+
+    return True
+
+
+def can_move_between(bsp, p0, p1, *,
+                     blocked_fn, z_max,
+                     player_height=72.0,
+                     sample_step=8.0):
+    """
+    Approximate a swept player movement by sampling body/head along the edge.
+    """
+    p0 = np.asarray(p0, dtype=np.float32)
+    p1 = np.asarray(p1, dtype=np.float32)
+    dist = float(np.linalg.norm(p1[:2] - p0[:2]))
+    steps = max(2, int(np.ceil(dist / sample_step)) + 1)
+
+    for i in range(steps + 1):
+        t = i / steps
+        p = p0 + (p1 - p0) * t
+        if not has_standing_clearance(
+            bsp, float(p[0]), float(p[1]), float(p[2]),
+            blocked_fn=blocked_fn,
+            z_max=z_max,
+            player_height=player_height,
+        ):
+            return False
+
+    return True
+
+
+def snap_neighbor_to_standing_z(ix, iy, z_guess, *,
+                                world_mins, voxel, nz,
+                                blocked_fn, z_min, z_max,
+                                stand_height=48.0, player_height=72.0,
+                                max_step_up=18.0, max_step_down=32.0):
+    x = float(world_mins[0] + (ix + 0.5) * voxel)
+    y = float(world_mins[1] + (iy + 0.5) * voxel)
+    z_origin = snap_to_standing_z(
+        x, y, z_guess,
+        blocked_fn=blocked_fn,
+        z_min=z_min,
+        z_max=z_max,
+        stand_height=stand_height,
+        player_height=player_height,
+        max_step_up=max_step_up,
+        max_step_down=max_step_down,
+    )
+    if z_origin is None:
+        return None
+
+    iz = z_to_iz(z_origin, float(world_mins[2]), voxel, nz)
+    if iz is None:
+        return None
+
+    return iz, z_origin
 
 
 
@@ -518,7 +659,7 @@ def flood_fill_3d_from_spawns(bsp, blocked_fn, *,
                               max_step_down=64.0):
     """
     Returns:
-      visited: set of (ix,iy,iz) reachable standing cells
+      visited: set of (ix,iy,iz) reachable fly-space cells
       aabb: (mins, maxs) of visited points (in world space, expanded by half voxel)
     """
     start_time = time.perf_counter()
@@ -535,115 +676,72 @@ def flood_fill_3d_from_spawns(bsp, blocked_fn, *,
     seeds = get_spawn_origins(bsp)
     q = deque()
     
-    seeds_visited = set()
+    enqueued = set()
     print("Seed spawns:", len(seeds))
-    snap_cache = SnapCache(bucket_voxels=2)
 
-    # Seed initialization: snap each spawn to a standing z at its (x,y)
+    clearance_cache = {}
+
+    def cell_has_fly_clearance(ix, iy, iz):
+        state = (ix, iy, iz)
+        if state in clearance_cache:
+            return clearance_cache[state]
+        p = cell_center(ix, iy, iz, world_mins, voxel)
+        ok = has_fly_clearance(
+            bsp, p,
+            blocked_fn=blocked_fn,
+            player_height=player_height,
+        )
+        clearance_cache[state] = ok
+        return ok
+
+    def enqueue_seed_cell(ix, iy, iz):
+        state = (ix, iy, iz)
+        if state in enqueued:
+            return False
+        if not (0 <= ix < nx and 0 <= iy < ny and 0 <= iz < nz):
+            return False
+        if not cell_has_fly_clearance(ix, iy, iz):
+            return False
+        enqueued.add(state)
+        q.append(state)
+        return True
+
+    # Seed initialization: use spawn origins as air-volume seeds. If the voxel center
+    # nearest a spawn is clipped, search a tiny radius for a valid air cell.
     for s in seeds:
-        #print("Processing seed:", s)
         cell = world_to_cell(s, world_mins, voxel, nx, ny, nz)
         if cell is None:
             continue
         ix, iy, iz = cell
-        c = cell_center(ix, iy, iz, world_mins, voxel)
-        x, y, z_guess = float(c[0]), float(c[1]), float(c[2])
-
-        # this is a little confusing - this actually checks that the player can stand at that location. And then gets the z.
-        # also it gets a world z, not a cell z. which is confusing because snap makes it sound lik eit would return iz not z.
-        z_cur = snap_to_standing_z_cached(
-            ix, iy, iz,
-            world_mins=world_mins, voxel=voxel, nz=nz,
-            blocked_fn=blocked_fn, z_min=float(world_mins[2]), z_max=float(world_maxs[2]),
-            cache=snap_cache,
-            stand_height=stand_height, player_height=player_height,
-            max_step_up=max_step_up, max_step_down=max_step_down
-        )
-        if z_cur is None:
+        if enqueue_seed_cell(ix, iy, iz):
             continue
 
-        # z0 = snap_to_standing_z(
-        #     x, y, z_guess,
-        #     blocked_fn=blocked_fn,
-        #     z_min=float(world_mins[2]),
-        #     z_max=float(world_maxs[2]),
-        #     stand_height=stand_height,
-        #     player_height=player_height,
-        #     max_step_up=max_step_up,
-        #     max_step_down=max_step_down,
-        # )
-        # if z0 is None:
-        #     continue
+        seeded = False
+        for r in range(1, 3):
+            for dx in range(-r, r + 1):
+                for dy in range(-r, r + 1):
+                    for dz in range(-r, r + 1):
+                        if enqueue_seed_cell(ix + dx, iy + dy, iz + dz):
+                            seeded = True
+                            break
+                    if seeded:
+                        break
+                if seeded:
+                    break
+            if seeded:
+                break
 
-        iz0 = z_to_iz(z_cur, float(world_mins[2]), voxel, nz)
-        if iz0 is None:
-            continue
+    print("Initial reachable cells:", len(enqueued))
 
-        state = (ix, iy, iz0)
-        if state not in seeds_visited:
-            seeds_visited.add(state)
-            q.append(state)
-
-    # note - the initial q/visited arrays are smaller than expected. But I think it might be because, depending on grid size, 
-    # you might have multiple spawns in the same cell, so they get de-duped.
-    print("Initial reachable cells:", len(seeds_visited))
-    #sys.exit(0)
-
-    # 6-neighbor expansion in grid
+    # 6-neighbor expansion through connected flyable air volume.
     nbrs = [(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)]
     visited = set()
-    
-    # Cache for has_floor_and_ceiling results
-    floor_ceil_cache = {}
 
     # explore nodes in queue. Neighbor nodes are added and explored in turn, until queu is exhausted.
     while q:
         ix, iy, iz = q.popleft()
-        c = cell_center(ix, iy, iz, world_mins, voxel)
-        x0, y0, z0 = float(c[0]), float(c[1]), float(c[2])
-        #print("Evaluating cell:", (ix, iy, iz), "visited:", len(visited))
 
-        # Snap current to get a stable z_guess for neighbors (optional but helps)
-        # z_current = snap_to_standing_z_cached(
-        #     ix, iy, iz,
-        #     world_mins=world_mins, 
-        #     voxel=voxel, 
-        #     nz=nz,
-        #     blocked_fn=blocked_fn, 
-        #     z_min=float(world_mins[2]), 
-        #     z_max=float(world_maxs[2]),
-        #     cache=snap_cache,
-        #     stand_height=stand_height, player_height=player_height,
-        #     max_step_up=max_step_up, max_step_down=max_step_down
-        # )
-        # # z_current = snap_to_standing_z(
-        # #     x0, y0, z_guess0,
-        # #     blocked_fn=blocked_fn,
-        # #     z_min=float(world_mins[2]),
-        # #     z_max=float(world_maxs[2]),
-        # #     stand_height=stand_height,
-        # #     player_height=player_height,
-        # #     max_step_up=max_step_up,
-        # #     max_step_down=max_step_down,
-        # # )
-        # if z_current is None:
-        #     continue
-
-        if blocked_fn(np.array([x0, y0, z0], dtype=np.float32)):
-            continue
-
-        if not has_floor_and_ceiling_cached(
-            ix, iy, iz,
-            world_mins=world_mins,
-            voxel=voxel,
-            nz=nz,
-            blocked_fn=blocked_fn,
-            z_min=float(world_mins[2]),
-            z_max=float(world_maxs[2]),
-            cache=floor_ceil_cache,
-            stand_height=stand_height,
-            player_height=player_height
-        ):
+        if not cell_has_fly_clearance(ix, iy, iz):
             continue
 
         st = (ix, iy, iz)
@@ -658,47 +756,23 @@ def flood_fill_3d_from_spawns(bsp, blocked_fn, *,
             if not (0 <= ix2 < nx and 0 <= iy2 < ny and 0 <= iz2 < nz):
                 continue
 
-            #c2 = cell_center(ix2, iy2, iz2, world_mins, voxel)
-            #x2, y2 = float(c2[0]), float(c2[1])
-
-            # Neighbor z guess: keep close to current snapped z
-            #z_guess2 = z0 + dz * voxel
-
-            # todo optimize>? - we are calling this here when we add to q, but then again above when we pop and process q
-            # z2 = snap_to_standing_z_cached(
-            #     ix2, iy2, iz2,
-            #     world_mins=world_mins, 
-            #     voxel=voxel, 
-            #     nz=nz,
-            #     blocked_fn=blocked_fn, 
-            #     z_min=float(world_mins[2]), 
-            #     z_max=float(world_maxs[2]),
-            #     cache=snap_cache,
-            #     stand_height=stand_height, player_height=player_height,
-            #     max_step_up=max_step_up, max_step_down=max_step_down
-            # )
-            # z2 = snap_to_standing_z(
-            #     x2, y2, z_guess2,
-            #     blocked_fn=blocked_fn,
-            #     z_min=float(world_mins[2]),
-            #     z_max=float(world_maxs[2]),
-            #     stand_height=stand_height,
-            #     player_height=player_height,
-            #     max_step_up=max_step_up,
-            #     max_step_down=max_step_down,
-            # )
-            # if z2 is None:
-            #     continue
-
-            # iz_snapped = z_to_iz(z2, float(world_mins[2]), voxel, nz)
-            # if iz_snapped is None:
-            #     continue
-
             st2 = (ix2, iy2, iz2)
-            if st2 in visited:
+            if st2 in visited or st2 in enqueued:
+                continue
+            if not cell_has_fly_clearance(ix2, iy2, iz2):
+                continue
+
+            p0 = cell_center(ix, iy, iz, world_mins, voxel)
+            p1 = cell_center(ix2, iy2, iz2, world_mins, voxel)
+            if not can_fly_between(
+                bsp, p0, p1,
+                blocked_fn=blocked_fn,
+                player_height=player_height,
+                sample_step=max(4.0, voxel / 4.0),
+            ):
                 continue
             #print("Adding reachable cell:", st2)
-            #visited.add(st2)
+            enqueued.add(st2)
             q.append(st2)
 
     # Build AABB in world space
@@ -715,6 +789,8 @@ def flood_fill_3d_from_spawns(bsp, blocked_fn, *,
 
     mn = np.array([min(xs) - half, min(ys) - half, min(zs) - half], dtype=np.float32)
     mx = np.array([max(xs) + half, max(ys) + half, max(zs) + half], dtype=np.float32)
+    mn = np.maximum(mn, world_mins)
+    mx = np.minimum(mx, world_maxs)
     
     elapsed = time.perf_counter() - start_time
     print(f"flood_fill_3d_from_spawns completed in {elapsed:.2f} seconds")
@@ -802,7 +878,8 @@ print("reachable AABB:", aabb)
 vlist = list(visited)
 x,y,z = vlist[0]
 print("Example cell 1:", cell_center(x, y, z, world_mins, VOXEL))
-print("Example cell 18:", cell_center(vlist[18][0], vlist[18][1], vlist[18][2], world_mins, VOXEL))
+for i, (rx, ry, rz) in enumerate(random.sample(vlist, min(4, len(vlist))), start=1):
+    print(f"Random cell {i}:", (rx, ry, rz), "world coords:", cell_center(rx, ry, rz, world_mins, VOXEL))
 
 # cell with max z
 max_z_cell = max(visited, key=lambda c: c[2])
@@ -827,32 +904,4 @@ print("Cell with min z:", min_z_cell, "world coords:", cell_center(min_z_cell[0]
 # ax.scatter(xs, ys, zs, c='blue', marker='o')
 # plt.show()
 
-
-###
-# this is doing something but takes a long time.
-# snap_to_standing_z() taking way too long. even with cache still slow. investigate.
-##
-
-## somehow z is exceeding z_max
-## exmaples:
-#blocked_cache hit: (2696, 1288, 141304992) -> False
-#blocked_cache hit: (2696, 1288, 141305024) -> False
-
-## ok the snap_to_standing() issue is resolved now, it had an infinite loop now fixed.
-
-# another issue - it is only finding reachable cells on the z=8 plane.
-# a) check is this map really all on the 8 plane? -- YEAH I GUESS THE SPAWNS ARE.
-# b) also the snap_to_standing_z() function is probably limiting z movement. We want to allow all valid z values.
-
-# i think next step is, we need a has_floor_and_ceiling() function, and spearate that logic from snap_to_standing_z()
-# snap_to_standing_z() probably only needed for spawns? Then for neighbor cell exploration use has_floor_and_ceiling()?
-
-# ok latest update - now it is finding reachable cells across multiple z planes, which is good. 
-# it is kinda slow but finnishes about 6s for avg map, maybe ok.
-# definitely needs cleanup and further analysis.
-# next step now is probably placing cameras.
-
-# ok nvm maybe not working good. Before it was rougly good cells but after checking max and min cells it was finding some outside the map.
-# so I tried making the voxel smaller, but still getting cells outside the playable map (current max is way outside).
-# so more work needed...
 

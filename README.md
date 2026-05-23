@@ -41,6 +41,12 @@ searching for things like "map that had a car over by the lake, and it was night
 I think I left off here working on debug_voxel_test.py. Trying a new approach for identifying "playable bounds" of a map, because existing methods were not working well enough. Well the world AABB bounds are fine, but I want something more precise than a single AABB. Also the camera placement has been really problematic so far. The voxel_test is currently identifying a few  playable nodes, but doesn't seem like enough, and I'm not sure yet if correct.
 
 
+### May 23, 2026
+
+ChatGPT 5.5 made some improvements. voxel test is better, not perfect, but maybe good enough to start using. Takes about 30 seconds on a
+small-medium map which seems reasonable.
+
+
 ## Todo
 
  - consider upgrading to qwen3
