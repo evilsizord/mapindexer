@@ -1,5 +1,4 @@
 from pathlib import Path
-import sys
 import time
 import os
 import random
@@ -12,39 +11,15 @@ if os.environ.get("MAPINDEXER_NO_NUMBA", "0") != "1":
         _NUMBA_AVAILABLE = True
     except Exception:
         _NUMBA_AVAILABLE = False
-from math import atan2, degrees
 from bsp_tool import load_bsp
 from collections import deque, defaultdict
 from itertools import combinations
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
 
 ## In this version, trying a 3d grid sampling approach instead of 2.5d
 
 CONTENTS_SOLID     = 0x00000001
 VOXEL = 32.0            # grid resolution
-STAND_HEIGHT = 48.0     # player origin above floor
-PLAYER_HEIGHT = 72.0    # standing clearance
-MAX_STEP_UP = 18.0      # normal step height
-MAX_STEP_DOWN = 32.0    # allow dropping off small ledges
-
-
-
-
-class SnapCache:
-    def __init__(self, bucket_voxels=2):
-        # bucket_voxels=2 means bucket size = 2 * voxel
-        self.bucket_voxels = int(bucket_voxels)
-        self.cache = {}  # (ix, iy, iz_bucket) -> (z_origin or None)
-
-    def bucket(self, iz):
-        return iz // self.bucket_voxels
-
-    def get(self, ix, iy, iz):
-        return self.cache.get((ix, iy, self.bucket(iz)), "MISS")
-
-    def set(self, ix, iy, iz, value):
-        self.cache[(ix, iy, self.bucket(iz))] = value
+PLAYER_HEIGHT = 72.0    # player hull height for clearance checks
 
 
 # -------------------------
@@ -177,16 +152,6 @@ def get_spawn_origins(bsp):
 
 
 
-# -------------------------
-# Point classification
-# -------------------------
-
-def point_inside_any(point, brush_set):
-    for n, d in brush_set:
-        if point_in_convex_brush(point, n, d):
-            return True
-    return False
-
 def query_candidates(grid, point, cell=1024.0):
     c = tuple(np.floor(point / cell).astype(int))
     return grid.get(c, [])
@@ -289,77 +254,6 @@ def build_spatial_hash(aabb_mins, aabb_maxs, cell=1024.0):
     return grid
 
 
-def find_floor_z(x, y, z_start, z_min, blocked_fn, *, coarse=128.0, refine=8.0):
-    """
-    Finds the highest 'solid' point below z_start (approx floor).
-    We want a transition from air -> blocked.
-    Returns z_floor (solid-ish), or None.
-    """
-    z = z_start
-    last_air = None
-    #print("find_floor_z: x,y,z_start:", x, y, z_start, "z_min:", z_min)
-
-    # march downward until we hit solid
-    while z >= z_min:
-        p = np.array([x, y, z], dtype=np.float32)
-        if blocked_fn(p):
-            # refine using binary search between blocked z (z) and last known air
-            lo = z
-            hi = (last_air if last_air is not None else z_start)
-            # if hi is below lo, return lo
-            if hi < lo:
-                return lo
-            best = None
-            # binary refine until desired precision
-            while (hi - lo) > refine:
-                mid = (lo + hi) * 0.5
-                p2 = np.array([x, y, mid], dtype=np.float32)
-                if blocked_fn(p2):
-                    lo = mid
-                else:
-                    hi = mid
-            # lo is approx highest blocked
-            return lo
-        last_air = z
-        z -= coarse
-
-    return None
-
-def find_ceiling_z(x, y, z_start, z_max, blocked_fn, *, coarse=128.0, refine=8.0):
-    """
-    Finds the lowest 'solid' point above z_start (approx ceiling).
-    We want a transition from air -> blocked above.
-    Returns z_ceil (solid-ish), or None.
-    """
-    z = z_start
-    last_air = None
-    #print("Find ceiling from z_start:", z_start, "to z_max:", z_max)
-
-    # march upward until we hit solid
-    while z <= z_max:
-        p = np.array([x, y, z], dtype=np.float32)
-        if blocked_fn(p):
-            # refine using binary search between last known air (below) and blocked z (z)
-            lo = (last_air if last_air is not None else z_start)
-            hi = z
-            if hi < lo:
-                return hi
-            # binary refine until desired precision
-            while (hi - lo) > refine:
-                mid = (lo + hi) * 0.5
-                p2 = np.array([x, y, mid], dtype=np.float32)
-                if blocked_fn(p2):
-                    hi = mid
-                else:
-                    lo = mid
-            # hi is approx lowest blocked
-            return hi
-        last_air = z
-        z += coarse
-
-    return None
-
-
 def point_to_leaf_index(bsp, point):
     """
     Traverse the BSP tree and return the leaf containing point.
@@ -386,29 +280,6 @@ def point_to_leaf_index(bsp, point):
 def point_in_playable_leaf(bsp, point):
     leaf_index = point_to_leaf_index(bsp, point)
     return leaf_index is not None and bsp.LEAVES[leaf_index].cluster >= 0
-
-
-def has_standing_clearance(bsp, x, y, z_origin, *,
-                           blocked_fn, z_max,
-                           player_height=72.0, eps=1.0):
-    """
-    Validate a player origin: body/head are in air and in non-solid BSP leafs.
-    """
-    p_origin = np.array([x, y, z_origin], dtype=np.float32)
-    p_head = np.array([x, y, z_origin + player_height], dtype=np.float32)
-
-    if blocked_fn(p_origin) or blocked_fn(p_head):
-        return False
-    if not point_in_playable_leaf(bsp, p_origin):
-        return False
-    if not point_in_playable_leaf(bsp, p_head):
-        return False
-
-    ceil = find_ceiling_z(x, y, z_origin, z_max, blocked_fn, coarse=6.0, refine=2.0)
-    if ceil is not None and ceil <= z_origin + player_height + eps:
-        return False
-
-    return True
 
 
 def has_fly_clearance(bsp, point, *, blocked_fn, player_height=72.0):
@@ -454,187 +325,6 @@ def can_fly_between(bsp, p0, p1, *,
     return True
 
 
-def can_move_between(bsp, p0, p1, *,
-                     blocked_fn, z_max,
-                     player_height=72.0,
-                     sample_step=8.0):
-    """
-    Approximate a swept player movement by sampling body/head along the edge.
-    """
-    p0 = np.asarray(p0, dtype=np.float32)
-    p1 = np.asarray(p1, dtype=np.float32)
-    dist = float(np.linalg.norm(p1[:2] - p0[:2]))
-    steps = max(2, int(np.ceil(dist / sample_step)) + 1)
-
-    for i in range(steps + 1):
-        t = i / steps
-        p = p0 + (p1 - p0) * t
-        if not has_standing_clearance(
-            bsp, float(p[0]), float(p[1]), float(p[2]),
-            blocked_fn=blocked_fn,
-            z_max=z_max,
-            player_height=player_height,
-        ):
-            return False
-
-    return True
-
-
-def snap_neighbor_to_standing_z(ix, iy, z_guess, *,
-                                world_mins, voxel, nz,
-                                blocked_fn, z_min, z_max,
-                                stand_height=48.0, player_height=72.0,
-                                max_step_up=18.0, max_step_down=32.0):
-    x = float(world_mins[0] + (ix + 0.5) * voxel)
-    y = float(world_mins[1] + (iy + 0.5) * voxel)
-    z_origin = snap_to_standing_z(
-        x, y, z_guess,
-        blocked_fn=blocked_fn,
-        z_min=z_min,
-        z_max=z_max,
-        stand_height=stand_height,
-        player_height=player_height,
-        max_step_up=max_step_up,
-        max_step_down=max_step_down,
-    )
-    if z_origin is None:
-        return None
-
-    iz = z_to_iz(z_origin, float(world_mins[2]), voxel, nz)
-    if iz is None:
-        return None
-
-    return iz, z_origin
-
-
-
-def has_floor_and_ceiling(x, y, z, blocked_fn, z_min, z_max, stand_height=48.0, player_height=72.0, eps=1.0):
-    floor = find_floor_z(x, y, z, z_min, blocked_fn, coarse=6.0, refine=2.0)
-    if floor is None:
-        return False
-
-    z_origin = floor + stand_height
-
-    # Must be air at origin and at head
-    p_origin = np.array([x, y, z_origin], dtype=np.float32)
-    p_head   = np.array([x, y, floor + player_height], dtype=np.float32)
-    if blocked_fn(p_origin) or blocked_fn(p_head):
-        return False
-
-    # Ceiling constraint: ceiling must be above head
-    ceil = find_ceiling_z(x, y, z_origin, z_max, blocked_fn, coarse=6.0, refine=2.0)
-    if ceil is not None and ceil <= z_origin + player_height + eps:
-        return False
-
-    return True
-
-
-def has_floor_and_ceiling_cached(ix, iy, iz, *,
-                                 world_mins, voxel, nz,
-                                 blocked_fn, z_min, z_max,
-                                 cache: dict,
-                                 stand_height=48.0, player_height=72.0, eps=1.0):
-    """
-    Cached version of has_floor_and_ceiling. Uses a dict cache keyed by (ix, iy, iz).
-    """
-    key = (ix, iy, iz)
-    if key in cache:
-        return cache[key]
-
-    # Convert cell indices to world coords
-    c = cell_center(ix, iy, iz, world_mins, voxel)
-    x = float(c[0])
-    y = float(c[1])
-    z = float(c[2])
-
-    result = has_floor_and_ceiling(
-        x, y, z,
-        blocked_fn=blocked_fn,
-        z_min=z_min,
-        z_max=z_max,
-        stand_height=stand_height,
-        player_height=player_height,
-        eps=eps
-    )
-
-    cache[key] = result
-    return result
-
-
-
-def snap_to_standing_z(x, y, z_guess, *,
-                       blocked_fn,
-                       z_min, z_max,
-                       stand_height=48.0,
-                       player_height=72.0,
-                       max_step_up=18.0,
-                       max_step_down=64.0,
-                       eps=1.0):
-    """
-    Returns z_origin for player (standing) if (x,y) has a reachable floor near z_guess.
-    Otherwise returns None.
-    """
-
-    # Search for floor near the guess: allow stepping up/down a bit.
-    # We probe from (z_guess + some headroom) downward.
-    probe_top = min(z_guess + player_height, z_max)
-    floor = find_floor_z(x, y, probe_top, z_min, blocked_fn, coarse=128.0, refine=8.0)
-    if floor is None:
-        return None
-
-    z_origin = floor + stand_height
-
-    # Step constraint relative to guess:
-    dz = z_origin - z_guess
-    if dz > max_step_up + eps:
-        return None
-    if dz < -max_step_down - eps:
-        return None
-
-    # Must be air at origin and at head
-    p_origin = np.array([x, y, z_origin], dtype=np.float32)
-    p_head   = np.array([x, y, z_origin + player_height], dtype=np.float32)
-    if blocked_fn(p_origin) or blocked_fn(p_head):
-        return None
-
-    # Ceiling constraint: ceiling must be above head
-    ceil = find_ceiling_z(x, y, z_origin, z_max, blocked_fn, coarse=128.0, refine=8.0)
-    if ceil is not None and ceil <= z_origin + player_height + eps:
-        return None
-
-    return z_origin
-
-
-def snap_to_standing_z_cached(ix, iy, iz_guess, *,
-                              world_mins, voxel, nz,
-                              blocked_fn, z_min, z_max,
-                              cache: SnapCache,
-                              stand_height=48.0, player_height=72.0,
-                              max_step_up=18.0, max_step_down=64.0):
-    hit = cache.get(ix, iy, iz_guess)
-    if hit != "MISS":
-        return hit  # may be None or z_origin
-
-    # Convert cell indices to world coords
-    x = float(world_mins[0] + (ix + 0.5) * voxel)
-    y = float(world_mins[1] + (iy + 0.5) * voxel)
-    z_guess = float(world_mins[2] + (iz_guess + 0.5) * voxel)
-
-    z_origin = snap_to_standing_z(
-        x, y, z_guess,
-        blocked_fn=blocked_fn,
-        z_min=z_min,
-        z_max=z_max,
-        stand_height=stand_height,
-        player_height=player_height,
-        max_step_up=max_step_up,
-        max_step_down=max_step_down,
-    )
-
-    cache.set(ix, iy, iz_guess, z_origin)
-    return z_origin
-
-
 def world_to_cell(p, world_mins, voxel, nx, ny, nz):
     rel = (p - world_mins) / voxel
     ix, iy, iz = int(rel[0]), int(rel[1]), int(rel[2])
@@ -645,18 +335,10 @@ def world_to_cell(p, world_mins, voxel, nx, ny, nz):
 def cell_center(ix, iy, iz, world_mins, voxel):
     return world_mins + np.array([(ix + 0.5) * voxel, (iy + 0.5) * voxel, (iz + 0.5) * voxel], dtype=np.float32)
 
-def z_to_iz(z, world_mins_z, voxel, nz):
-    iz = int((z - world_mins_z) / voxel)
-    return iz if 0 <= iz < nz else None
 
-
-# main
-def flood_fill_3d_from_spawns(bsp, blocked_fn, *,
-                              voxel=64.0,
-                              stand_height=48.0,
-                              player_height=72.0,
-                              max_step_up=18.0,
-                              max_step_down=64.0):
+def flood_fill_flyable_volume_from_spawns(bsp, blocked_fn, *,
+                                           voxel=64.0,
+                                           player_height=72.0):
     """
     Returns:
       visited: set of (ix,iy,iz) reachable fly-space cells
@@ -793,12 +475,12 @@ def flood_fill_3d_from_spawns(bsp, blocked_fn, *,
     mx = np.minimum(mx, world_maxs)
     
     elapsed = time.perf_counter() - start_time
-    print(f"flood_fill_3d_from_spawns completed in {elapsed:.2f} seconds")
+    print(f"flood_fill_flyable_volume_from_spawns completed in {elapsed:.2f} seconds")
     
     return visited, (mn, mx)
 
 
-def make_blocked_fn(bsp):
+def make_blocked_fn(bsp, *, voxel=64.0):
     # Bounds from model 0
     model0 = bsp.MODELS[0]
     world_mins = np.array(model0.bounds.mins, dtype=np.float32)
@@ -830,12 +512,13 @@ def make_blocked_fn(bsp):
     aabb_maxs = np.stack(aabb_maxs, axis=0)
 
     # 2) Spatial hash broadphase
-    grid = build_spatial_hash(aabb_mins, aabb_maxs, cell=VOXEL*4)
+    grid_cell = voxel * 4
+    grid = build_spatial_hash(aabb_mins, aabb_maxs, cell=grid_cell)
 
     # Cache for is_blocked_point results. Keys are quantized bins (kx,ky,kz) -> bool
     blocked_cache = {}
     # Use a coarser cache epsilon (in world units) to increase reuse across nearby probes
-    cache_eps = max(0.25, VOXEL / 8.0)  # e.g. 8.0 for VOXEL=64
+    cache_eps = max(0.25, voxel / 8.0)  # e.g. 8.0 for voxel=64
 
     # lightweight stats for profiling call counts and cumulative time
     stats = {"calls": 0, "time": 0.0}
@@ -843,7 +526,7 @@ def make_blocked_fn(bsp):
     def blocked_fn(p):
         stats["calls"] += 1
         t0 = time.perf_counter()
-        res = is_blocked_point(p, grid, VOXEL*4, aabb_mins, aabb_maxs, normals_list, dists_list, eps=cache_eps, blocked_cache=blocked_cache, cache_eps=cache_eps)
+        res = is_blocked_point(p, grid, grid_cell, aabb_mins, aabb_maxs, normals_list, dists_list, eps=cache_eps, blocked_cache=blocked_cache, cache_eps=cache_eps)
         stats["time"] += (time.perf_counter() - t0)
         return res
 
@@ -853,55 +536,60 @@ def make_blocked_fn(bsp):
     return blocked_fn
 
 
-test_bsp = Path("C:\\repos\\mapindexer\\maps\\processed\\layout_del_1\\maps\\layout_del_1.bsp")
-bsp = load_bsp(str(test_bsp))
+def print_debug_cells(visited, world_mins, voxel):
+    print("reachable cells:", len(visited))
+    if not visited:
+        print("No reachable cells found.")
+        return
 
-# 1) Build blocking query (your existing optimized brush precompute)
-blocked_fn = make_blocked_fn(bsp)  # you implement using spatial hash + point-in-brush
+    vlist = list(visited)
+    x, y, z = vlist[0]
+    print("Example cell 1:", cell_center(x, y, z, world_mins, voxel))
+    for i, (rx, ry, rz) in enumerate(random.sample(vlist, min(4, len(vlist))), start=1):
+        print(f"Random cell {i}:", (rx, ry, rz), "world coords:", cell_center(rx, ry, rz, world_mins, voxel))
 
-# 2) Flood fill from spawns (3D, on-demand)
-visited, aabb = flood_fill_3d_from_spawns(
-    bsp, blocked_fn,
-    voxel=VOXEL,
-    stand_height=48.0,
-    player_height=72.0,
-    max_step_up=18.0,
-    max_step_down=32.0,
-)
+    max_z_cell = max(visited, key=lambda c: c[2])
+    print("Cell with max z:", max_z_cell, "world coords:", cell_center(max_z_cell[0], max_z_cell[1], max_z_cell[2], world_mins, voxel))
 
-model0 = bsp.MODELS[0]
-world_mins = np.array(model0.bounds.mins, dtype=np.float32)
-
-print("reachable cells:", len(visited))
-print("reachable AABB:", aabb)
-
-vlist = list(visited)
-x,y,z = vlist[0]
-print("Example cell 1:", cell_center(x, y, z, world_mins, VOXEL))
-for i, (rx, ry, rz) in enumerate(random.sample(vlist, min(4, len(vlist))), start=1):
-    print(f"Random cell {i}:", (rx, ry, rz), "world coords:", cell_center(rx, ry, rz, world_mins, VOXEL))
-
-# cell with max z
-max_z_cell = max(visited, key=lambda c: c[2])
-print("Cell with max z:", max_z_cell, "world coords:", cell_center(max_z_cell[0], max_z_cell[1], max_z_cell[2], world_mins, VOXEL))
-# outside :( wall is -488-440=48. and z=536 is inside a ceiling which should be z=528 max.)
-
-# cell with min z
-min_z_cell = min(visited, key=lambda c: c[2])
-print("Cell with min z:", min_z_cell, "world coords:", cell_center(min_z_cell[0], min_z_cell[1], min_z_cell[2], world_mins, VOXEL))
-# hah this is a utility room for the map builder. There should be no way our flood fill discovered this.
+    min_z_cell = min(visited, key=lambda c: c[2])
+    print("Cell with min z:", min_z_cell, "world coords:", cell_center(min_z_cell[0], min_z_cell[1], min_z_cell[2], world_mins, voxel))
 
 
-# 3d plot of visited
-# fig = plt.figure()
-# xs, ys, zs = [], [], []
-# for (ix, iy, iz) in visited:
-#     p = cell_center(ix, iy, iz, world_mins, VOXEL)
-#     xs.append(float(p[0])); 
-#     ys.append(float(p[1])); 
-#     zs.append(float(p[2]))
-# ax = fig.add_subplot(111, projection='3d')
-# ax.scatter(xs, ys, zs, c='blue', marker='o')
-# plt.show()
+def plot_visited_cells(visited, world_mins, voxel):
+    import matplotlib.pyplot as plt
+
+    fig = plt.figure()
+    xs, ys, zs = [], [], []
+    for (ix, iy, iz) in visited:
+        p = cell_center(ix, iy, iz, world_mins, voxel)
+        xs.append(float(p[0]))
+        ys.append(float(p[1]))
+        zs.append(float(p[2]))
+    ax = fig.add_subplot(111, projection="3d")
+    ax.scatter(xs, ys, zs, c="blue", marker="o")
+    plt.show()
+
+
+def main():
+    test_bsp = Path("C:\\repos\\mapindexer\\maps\\processed\\layout_del_1\\maps\\layout_del_1.bsp")
+    bsp = load_bsp(str(test_bsp))
+
+    blocked_fn = make_blocked_fn(bsp, voxel=VOXEL)
+    visited, aabb = flood_fill_flyable_volume_from_spawns(
+        bsp, blocked_fn,
+        voxel=VOXEL,
+        player_height=PLAYER_HEIGHT,
+    )
+
+    model0 = bsp.MODELS[0]
+    world_mins = np.array(model0.bounds.mins, dtype=np.float32)
+
+    print("reachable AABB:", aabb)
+    print_debug_cells(visited, world_mins, VOXEL)
+    # plot_visited_cells(visited, world_mins, VOXEL)
+
+
+if __name__ == "__main__":
+    main()
 
 
