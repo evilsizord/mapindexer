@@ -7,7 +7,7 @@ from bsp_tool import load_bsp
 from dataclasses import dataclass
 from typing import Dict, List, Iterable, Optional, Tuple, Set
 from itertools import combinations
-from bsp_helpers import Vec3, intersect_3_planes, point_inside_planes, is_junk_shader, is_clip_shader, is_solid_shader
+from mapindexer.bsp_helpers import Vec3, intersect_3_planes, point_inside_planes, is_junk_shader, is_clip_shader, is_solid_shader
 from bsp_tool.branches.id_software.quake3 import Leaf, Plane, Node, Brush, BrushSide, Texture
 
 
@@ -111,6 +111,11 @@ def analyze_bsp(bsp_path: Path) -> dict:
     )
 
     stats["complexity_score"] = round(complexity_score, 3)
+
+    # ------------------------------------------------
+    # 6. flood fill volume to determine actual playable area, and place cameras
+    # ------------------------------------------------
+
 
     (wmins, wmaxes) = compute_world_vertex_bounds(
         models=bsp.MODELS,

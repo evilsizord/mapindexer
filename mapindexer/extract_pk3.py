@@ -8,7 +8,7 @@ def extract_pk3(pk3_path, output_root, db_conn):
     pk3_path = Path(pk3_path)
     map_name = pk3_path.stem.lower()
 
-    out_dir = Path(output_root) / map_name #todo: wtf is this
+    out_dir = Path(output_root) / map_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
     arena_text = ""
