@@ -21,6 +21,12 @@ def main():
     parser.add_argument("--min-separation", type=float, default=512.0)
     parser.add_argument("--no-validate", action="store_true", help="Skip BSP collision/visibility validation")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--progress-interval",
+        type=float,
+        default=5.0,
+        help="Seconds between verbose progress messages while evaluating candidates",
+    )
     args = parser.parse_args()
 
     path = Path(args.path)
@@ -59,6 +65,7 @@ def process_bsp(bsp_path: Path, args):
         min_separation=args.min_separation,
         validate=not args.no_validate,
         verbose=args.verbose,
+        progress_interval=args.progress_interval,
     )
     camera_dicts = [camera.to_dict() for camera in cameras]
 

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
+from collections import Counter
 from dataclasses import dataclass
 from math import atan2, degrees
-from typing import Iterable, Optional
+from typing import Iterable
 
 import numpy as np
 from bsp_tool import load_bsp
@@ -79,24 +81,66 @@ def find_camera_candidates(
     min_separation: float = 512.0,
     validate: bool = True,
     verbose: bool = False,
+    progress_interval: float = 5.0,
 ) -> list[CameraCandidate]:
+    debug = CameraCandidateDebug(verbose=verbose, progress_interval=progress_interval)
+
+    debug.stage_start("extract anchors")
     anchors = extract_gameplay_anchors(bsp)
+    debug.stage_end("extract anchors", anchors=len(anchors), source="entities")
     if not anchors:
+        debug.stage_start("fallback leaf anchors")
         anchors = fallback_leaf_anchors(bsp)
+        debug.stage_end("fallback leaf anchors", anchors=len(anchors), source="leaves")
     if not anchors:
+        debug.finish(empty=True)
         return []
 
+    debug.stage_start("cluster anchors")
     clusters = cluster_anchors(anchors, radius=cluster_radius)
+    debug.stage_end("cluster anchors", clusters=len(clusters))
     world_bounds = _world_bounds(bsp)
-    blocked_fn = make_blocked_fn(bsp, voxel=128.0) if validate else None
+    debug.print_map_summary(bsp, anchors, clusters, world_bounds, validate)
+
+    debug.stage_start("build blocked function")
+    blocked_fn = (
+        make_blocked_fn(bsp, voxel=128.0, verbose=verbose, progress_interval=progress_interval)
+        if validate
+        else None
+    )
+    debug.stage_end(
+        "build blocked function",
+        enabled=validate,
+        callable=callable(blocked_fn) if validate else False,
+    )
 
     candidates = []
-    for cluster in clusters:
+    debug.stage_start("evaluate candidates")
+    for cluster_index, cluster in enumerate(clusters, start=1):
+        cluster_start = time.perf_counter()
+        cluster_generated = 0
+        cluster_valid = 0
+        cluster_visible_checks = 0
         for position in generate_candidate_positions(cluster.center, world_bounds):
-            if validate and not is_valid_camera_position(bsp, position, blocked_fn):
+            cluster_generated += 1
+            debug.generated_candidates += 1
+
+            valid_start = time.perf_counter()
+            valid, invalid_reason = validate_camera_position(bsp, position, blocked_fn) if validate else (True, None)
+            debug.validity_time += time.perf_counter() - valid_start
+            if not valid:
+                debug.invalid_reasons[invalid_reason] += 1
                 continue
+
+            cluster_valid += 1
+            debug.valid_candidates += 1
             yaw, pitch = yaw_pitch(position, cluster.center)
+            visibility_start = time.perf_counter()
             visible = count_visible_anchors(bsp, position, anchors, blocked_fn) if validate else len(anchors)
+            visibility_elapsed = time.perf_counter() - visibility_start
+            debug.visibility_time += visibility_elapsed
+            debug.visibility_checks += len(anchors) if validate else 0
+            cluster_visible_checks += len(anchors) if validate else 0
             score = score_candidate(position, cluster, visible, anchors, world_bounds)
             candidates.append(
                 CameraCandidate(
@@ -110,16 +154,176 @@ def find_camera_candidates(
                     cluster_weight=cluster.weight,
                 )
             )
+        debug.record_cluster(
+            cluster_index,
+            cluster,
+            generated=cluster_generated,
+            valid=cluster_valid,
+            visibility_checks=cluster_visible_checks,
+            elapsed=time.perf_counter() - cluster_start,
+        )
+        debug.maybe_print_progress(cluster_index, len(clusters), len(candidates), blocked_fn)
+    debug.stage_end("evaluate candidates", candidates=len(candidates))
 
+    debug.stage_start("select diverse candidates")
     selected = select_diverse_candidates(candidates, max_cameras=max_cameras, min_separation=min_separation)
+    debug.stage_end("select diverse candidates", selected=len(selected))
 
-    if verbose:
-        print(f"Anchors: {len(anchors)}")
-        print(f"Clusters: {len(clusters)}")
-        print(f"Candidates: {len(candidates)}")
-        print(f"Selected: {len(selected)}")
+    debug.finish(
+        generated=len(candidates),
+        selected=len(selected),
+        blocked_fn=blocked_fn,
+    )
 
     return selected
+
+
+@dataclass
+class CameraCandidateDebug:
+    verbose: bool = False
+    progress_interval: float = 5.0
+    generated_candidates: int = 0
+    valid_candidates: int = 0
+    visibility_checks: int = 0
+    validity_time: float = 0.0
+    visibility_time: float = 0.0
+
+    def __post_init__(self):
+        self.started_at = time.perf_counter()
+        self.last_progress_at = self.started_at
+        self.stage_started_at = None
+        self.stage_times = {}
+        self.invalid_reasons = Counter()
+        self.slowest_clusters = []
+
+    def stage_start(self, name: str):
+        if not self.verbose:
+            return
+        self.stage_started_at = time.perf_counter()
+        print(f"[camera-candidates] starting {name}")
+
+    def stage_end(self, name: str, **details):
+        if not self.verbose:
+            return
+        elapsed = time.perf_counter() - self.stage_started_at if self.stage_started_at is not None else 0.0
+        self.stage_times[name] = self.stage_times.get(name, 0.0) + elapsed
+        suffix = _format_debug_details(details)
+        print(f"[camera-candidates] finished {name} in {elapsed:.2f}s{suffix}")
+
+    def print_map_summary(self, bsp, anchors: list[Anchor], clusters: list[AnchorCluster], world_bounds, validate: bool):
+        if not self.verbose:
+            return
+        mins, maxs = world_bounds
+        anchor_classes = Counter(anchor.classname for anchor in anchors)
+        top_anchor_classes = ", ".join(f"{name}={count}" for name, count in anchor_classes.most_common(8))
+        cluster_sizes = [len(cluster.anchors) for cluster in clusters]
+        cluster_weights = [cluster.weight for cluster in clusters]
+        print(
+            "[camera-candidates] map summary: "
+            f"entities={len(getattr(bsp, 'ENTITIES', []))}, brushes={len(getattr(bsp, 'BRUSHES', []))}, "
+            f"leaves={len(getattr(bsp, 'LEAVES', []))}, anchors={len(anchors)}, clusters={len(clusters)}, "
+            f"validate={validate}"
+        )
+        print(
+            "[camera-candidates] world bounds: "
+            f"mins={mins.astype(float).round(1).tolist()}, maxs={maxs.astype(float).round(1).tolist()}, "
+            f"size={(maxs - mins).astype(float).round(1).tolist()}"
+        )
+        if top_anchor_classes:
+            print(f"[camera-candidates] top anchor classes: {top_anchor_classes}")
+        if cluster_sizes:
+            print(
+                "[camera-candidates] cluster stats: "
+                f"max_size={max(cluster_sizes)}, avg_size={sum(cluster_sizes) / len(cluster_sizes):.1f}, "
+                f"max_weight={max(cluster_weights):.1f}, avg_weight={sum(cluster_weights) / len(cluster_weights):.1f}"
+            )
+
+    def record_cluster(
+        self,
+        cluster_index: int,
+        cluster: AnchorCluster,
+        *,
+        generated: int,
+        valid: int,
+        visibility_checks: int,
+        elapsed: float,
+    ):
+        if not self.verbose:
+            return
+        self.slowest_clusters.append(
+            {
+                "index": cluster_index,
+                "elapsed": elapsed,
+                "anchors": len(cluster.anchors),
+                "weight": cluster.weight,
+                "generated": generated,
+                "valid": valid,
+                "visibility_checks": visibility_checks,
+            }
+        )
+        self.slowest_clusters = sorted(self.slowest_clusters, key=lambda item: -item["elapsed"])[:5]
+
+    def maybe_print_progress(self, cluster_index: int, cluster_count: int, candidates: int, blocked_fn):
+        if not self.verbose:
+            return
+        now = time.perf_counter()
+        if now - self.last_progress_at < self.progress_interval and cluster_index < cluster_count:
+            return
+        elapsed = now - self.started_at
+        blocked_suffix = _blocked_stats_suffix(blocked_fn)
+        print(
+            "[camera-candidates] progress: "
+            f"clusters={cluster_index}/{cluster_count}, generated_positions={self.generated_candidates}, "
+            f"valid_positions={self.valid_candidates}, candidates={candidates}, "
+            f"visibility_checks={self.visibility_checks}, elapsed={elapsed:.2f}s"
+            f"{blocked_suffix}"
+        )
+        self.last_progress_at = now
+
+    def finish(self, *, generated: int = 0, selected: int = 0, blocked_fn=None, empty: bool = False):
+        if not self.verbose:
+            return
+        elapsed = time.perf_counter() - self.started_at
+        print(f"[camera-candidates] total time: {elapsed:.2f}s")
+        if empty:
+            print("[camera-candidates] no anchors found; returning no candidates")
+            return
+        print(
+            "[camera-candidates] totals: "
+            f"generated_positions={self.generated_candidates}, valid_positions={self.valid_candidates}, "
+            f"candidates={generated}, selected={selected}, visibility_checks={self.visibility_checks}, "
+            f"validity_time={self.validity_time:.2f}s, visibility_time={self.visibility_time:.2f}s"
+            f"{_blocked_stats_suffix(blocked_fn)}"
+        )
+        if self.invalid_reasons:
+            reasons = ", ".join(f"{reason}={count}" for reason, count in self.invalid_reasons.most_common())
+            print(f"[camera-candidates] invalid camera positions: {reasons}")
+        if self.slowest_clusters:
+            print("[camera-candidates] slowest clusters:")
+            for item in self.slowest_clusters:
+                print(
+                    "  "
+                    f"#{item['index']}: {item['elapsed']:.2f}s, anchors={item['anchors']}, "
+                    f"weight={item['weight']:.1f}, generated={item['generated']}, "
+                    f"valid={item['valid']}, visibility_checks={item['visibility_checks']}"
+                )
+
+
+def _format_debug_details(details: dict) -> str:
+    visible_details = {key: value for key, value in details.items() if value is not None}
+    if not visible_details:
+        return ""
+    return ": " + ", ".join(f"{key}={value}" for key, value in visible_details.items())
+
+
+def _blocked_stats_suffix(blocked_fn) -> str:
+    stats = getattr(blocked_fn, "_stats", None)
+    if not stats:
+        return ""
+    return (
+        f", blocked_calls={stats.get('calls', 0)}, blocked_time={stats.get('time', 0.0):.2f}s, "
+        f"blocked_build_time={stats.get('build_time', 0.0):.2f}s"
+    )
 
 
 def extract_gameplay_anchors(bsp) -> list[Anchor]:
@@ -217,10 +421,17 @@ def generate_candidate_positions(center: np.ndarray, world_bounds: tuple[np.ndar
 
 
 def is_valid_camera_position(bsp, position: np.ndarray, blocked_fn) -> bool:
+    valid, _ = validate_camera_position(bsp, position, blocked_fn)
+    return valid
+
+
+def validate_camera_position(bsp, position: np.ndarray, blocked_fn) -> tuple[bool, str | None]:
     leaf_index = point_to_leaf_index(bsp, position)
     if leaf_index is None or bsp.LEAVES[leaf_index].cluster < 0:
-        return False
-    return has_fly_clearance(bsp, position, blocked_fn=blocked_fn, player_height=32.0)
+        return False, "non_playable_leaf"
+    if not has_fly_clearance(bsp, position, blocked_fn=blocked_fn, player_height=32.0):
+        return False, "clearance_failed"
+    return True, None
 
 
 def count_visible_anchors(bsp, position: np.ndarray, anchors: list[Anchor], blocked_fn) -> int:
@@ -295,6 +506,12 @@ def main():
     parser.add_argument("--min-separation", type=float, default=512.0)
     parser.add_argument("--no-validate", action="store_true", help="Skip BSP collision/visibility validation")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--progress-interval",
+        type=float,
+        default=5.0,
+        help="Seconds between verbose progress messages while evaluating candidates",
+    )
     args = parser.parse_args()
 
     bsp = load_bsp(args.path)
@@ -305,6 +522,7 @@ def main():
         min_separation=args.min_separation,
         validate=not args.no_validate,
         verbose=args.verbose,
+        progress_interval=args.progress_interval,
     )
     print(json.dumps([camera.to_dict() for camera in cameras], indent=2))
 

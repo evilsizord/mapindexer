@@ -36,7 +36,7 @@ def brush_planes(bsp, brush):
         distances.append(p.distance)
     return np.asarray(normals, dtype=np.float64), np.asarray(distances, dtype=np.float64)
 
-def brush_aabb_from_planes(normals, distances, inside_eps=0.25, det_eps=1e-8):
+def brush_aabb_from_planes(normals, distances, inside_eps=0.25, det_eps=1e-8, max_exact_sides=None, fallback_bounds=None):
     """
     Compute convex brush vertices from plane triplets, then AABB.
     Robust to plane orientation by accepting either <= or >= convention.
@@ -44,6 +44,13 @@ def brush_aabb_from_planes(normals, distances, inside_eps=0.25, det_eps=1e-8):
     m = normals.shape[0]
     if m < 4:
         return None
+
+    axis_aabb = brush_aabb_from_axis_planes(normals, distances)
+    if axis_aabb is not None:
+        return axis_aabb
+
+    if max_exact_sides is not None and m > max_exact_sides:
+        return fallback_bounds
 
     pts_le = []
     pts_ge = []
@@ -64,6 +71,35 @@ def brush_aabb_from_planes(normals, distances, inside_eps=0.25, det_eps=1e-8):
 
     P = np.stack(pts, axis=0)
     return P.min(axis=0).astype(np.float32), P.max(axis=0).astype(np.float32)
+
+
+def brush_aabb_from_axis_planes(normals, distances, *, axis_eps=1e-4, fallback_bounds=None):
+    """
+    Build a conservative AABB from axis-aligned brush planes in O(n).
+
+    Large BSP brushes often include six axial box planes plus many bevel planes.
+    The exact vertex reconstruction is cubic in plane count, so those brushes can
+    dominate runtime. Axis planes are enough for broadphase bounds when present.
+    """
+    coord_values = [[], [], []]
+
+    for normal, distance in zip(normals, distances):
+        abs_normal = np.abs(normal)
+        axis = int(np.argmax(abs_normal))
+        sign = float(normal[axis])
+        if abs(sign) < 1.0 - axis_eps:
+            continue
+        other_axes = [i for i in range(3) if i != axis]
+        if any(abs(float(normal[i])) > axis_eps for i in other_axes):
+            continue
+        coord_values[axis].append(float(distance) / sign)
+
+    if all(values for values in coord_values):
+        mins = np.array([min(values) for values in coord_values], dtype=np.float32)
+        maxs = np.array([max(values) for values in coord_values], dtype=np.float32)
+        return mins, maxs
+
+    return fallback_bounds
 
 def point_in_convex_brush(point, normals, distances, eps=0.25):
     """
@@ -550,24 +586,98 @@ def flood_fill_flyable_volume_from_spawns(
     return visited, (mn, mx)
 
 
-def make_blocked_fn(bsp, *, voxel=64.0):
+def make_blocked_fn(bsp, *, voxel=64.0, verbose=False, progress_interval=5.0, max_exact_aabb_sides=32):
+    start_time = time.perf_counter()
+    last_progress_time = start_time
+
     # Bounds from model 0
     model0 = bsp.MODELS[0]
     world_mins = np.array(model0.bounds.mins, dtype=np.float32)
     world_maxs = np.array(model0.bounds.maxs, dtype=np.float32)
+    if verbose:
+        print(
+            "[blocked-fn] starting build: "
+            f"brushes={len(getattr(bsp, 'BRUSHES', []))}, voxel={voxel}, "
+            f"max_exact_aabb_sides={max_exact_aabb_sides}, "
+            f"world_mins={world_mins.astype(float).round(1).tolist()}, "
+            f"world_maxs={world_maxs.astype(float).round(1).tolist()}"
+        )
 
     # 1) Compile blocking brushes + precompute planes + AABBs
     normals_list = []
     dists_list = []
     aabb_mins = []
     aabb_maxs = []
+    filter_time = 0.0
+    plane_time = 0.0
+    aabb_time = 0.0
+    skipped_nonblocking = 0
+    aabb_failed = 0
+    fast_aabb_count = 0
+    fallback_world_aabb_count = 0
+    max_sides = 0
+    slowest_brushes = []
 
-    for br in bsp.BRUSHES:
-        if (not is_playerclip(bsp, br)) and (not is_solid_world(bsp, br)):
+    for brush_index, br in enumerate(bsp.BRUSHES, start=1):
+        max_sides = max(max_sides, br.num_sides)
+        brush_start = time.perf_counter()
+
+        filter_start = time.perf_counter()
+        is_blocking = is_playerclip(bsp, br) or is_solid_world(bsp, br)
+        filter_time += time.perf_counter() - filter_start
+        if not is_blocking:
+            skipped_nonblocking += 1
+            now = time.perf_counter()
+            if verbose and now - last_progress_time >= progress_interval:
+                _print_blocked_fn_progress(
+                    brush_index,
+                    len(bsp.BRUSHES),
+                    len(aabb_mins),
+                    skipped_nonblocking,
+                    aabb_failed,
+                    filter_time,
+                    plane_time,
+                    aabb_time,
+                    start_time,
+                    fast_aabb_count,
+                    fallback_world_aabb_count,
+                )
+                last_progress_time = now
             continue
+
+        plane_start = time.perf_counter()
         n, d = brush_planes(bsp, br)
-        aabb = brush_aabb_from_planes(n, d)
+        plane_time += time.perf_counter() - plane_start
+
+        aabb_start = time.perf_counter()
+        axis_aabb = brush_aabb_from_axis_planes(n, d)
+        if axis_aabb is not None:
+            aabb = axis_aabb
+            fast_aabb_count += 1
+        elif max_exact_aabb_sides is None or br.num_sides <= max_exact_aabb_sides:
+            aabb = brush_aabb_from_planes(n, d)
+        else:
+            aabb = (world_mins, world_maxs)
+            fallback_world_aabb_count += 1
+        aabb_time += time.perf_counter() - aabb_start
         if aabb is None:
+            aabb_failed += 1
+            now = time.perf_counter()
+            if verbose and now - last_progress_time >= progress_interval:
+                _print_blocked_fn_progress(
+                    brush_index,
+                    len(bsp.BRUSHES),
+                    len(aabb_mins),
+                    skipped_nonblocking,
+                    aabb_failed,
+                    filter_time,
+                    plane_time,
+                    aabb_time,
+                    start_time,
+                    fast_aabb_count,
+                    fallback_world_aabb_count,
+                )
+                last_progress_time = now
             continue
         mn, mx = aabb
         normals_list.append(n.astype(np.float32))
@@ -575,15 +685,72 @@ def make_blocked_fn(bsp, *, voxel=64.0):
         aabb_mins.append(mn)
         aabb_maxs.append(mx)
 
+        brush_elapsed = time.perf_counter() - brush_start
+        slowest_brushes.append((brush_elapsed, brush_index, br.num_sides))
+        slowest_brushes = sorted(slowest_brushes, key=lambda item: -item[0])[:5]
+
+        now = time.perf_counter()
+        if verbose and now - last_progress_time >= progress_interval:
+            _print_blocked_fn_progress(
+                brush_index,
+                len(bsp.BRUSHES),
+                len(aabb_mins),
+                skipped_nonblocking,
+                aabb_failed,
+                filter_time,
+                plane_time,
+                aabb_time,
+                start_time,
+                fast_aabb_count,
+                fallback_world_aabb_count,
+            )
+            last_progress_time = now
+
     if not aabb_mins:
+        if verbose:
+            elapsed = time.perf_counter() - start_time
+            print(
+                "[blocked-fn] no blocking brush AABBs built: "
+                f"elapsed={elapsed:.2f}s, skipped_nonblocking={skipped_nonblocking}, "
+                f"aabb_failed={aabb_failed}, filter_time={filter_time:.2f}s, "
+                f"plane_time={plane_time:.2f}s, aabb_time={aabb_time:.2f}s, "
+                f"fast_aabb={fast_aabb_count}, fallback_world_aabb={fallback_world_aabb_count}"
+            )
         return []
+
+    compile_elapsed = time.perf_counter() - start_time
+    if verbose:
+        print(
+            "[blocked-fn] compiled brushes: "
+            f"blocking_aabbs={len(aabb_mins)}, skipped_nonblocking={skipped_nonblocking}, "
+            f"aabb_failed={aabb_failed}, max_sides={max_sides}, elapsed={compile_elapsed:.2f}s, "
+            f"filter_time={filter_time:.2f}s, plane_time={plane_time:.2f}s, aabb_time={aabb_time:.2f}s, "
+            f"fast_aabb={fast_aabb_count}, fallback_world_aabb={fallback_world_aabb_count}"
+        )
+        if slowest_brushes:
+            slowest = ", ".join(
+                f"#{brush_index} {elapsed:.2f}s sides={num_sides}"
+                for elapsed, brush_index, num_sides in slowest_brushes
+            )
+            print(f"[blocked-fn] slowest compiled brushes: {slowest}")
 
     aabb_mins = np.stack(aabb_mins, axis=0)
     aabb_maxs = np.stack(aabb_maxs, axis=0)
 
     # 2) Spatial hash broadphase
     grid_cell = voxel * 4
+    hash_start = time.perf_counter()
     grid = build_spatial_hash(aabb_mins, aabb_maxs, cell=grid_cell)
+    hash_time = time.perf_counter() - hash_start
+    if verbose:
+        bucket_sizes = [len(bucket) for bucket in grid.values()]
+        max_bucket = max(bucket_sizes) if bucket_sizes else 0
+        avg_bucket = sum(bucket_sizes) / len(bucket_sizes) if bucket_sizes else 0.0
+        print(
+            "[blocked-fn] spatial hash built: "
+            f"grid_cell={grid_cell}, buckets={len(grid)}, max_bucket={max_bucket}, "
+            f"avg_bucket={avg_bucket:.1f}, hash_time={hash_time:.2f}s"
+        )
 
     # Cache for is_blocked_point results. Keys are quantized bins (kx,ky,kz) -> bool
     blocked_cache = {}
@@ -591,7 +758,21 @@ def make_blocked_fn(bsp, *, voxel=64.0):
     cache_eps = max(0.25, voxel / 8.0)  # e.g. 8.0 for voxel=64
 
     # lightweight stats for profiling call counts and cumulative time
-    stats = {"calls": 0, "time": 0.0}
+    stats = {
+        "calls": 0,
+        "time": 0.0,
+        "build_time": time.perf_counter() - start_time,
+        "filter_time": filter_time,
+        "plane_time": plane_time,
+        "aabb_time": aabb_time,
+        "hash_time": hash_time,
+        "blocking_aabbs": len(aabb_mins),
+        "skipped_nonblocking": skipped_nonblocking,
+        "aabb_failed": aabb_failed,
+        "fast_aabb": fast_aabb_count,
+        "fallback_world_aabb": fallback_world_aabb_count,
+        "grid_buckets": len(grid),
+    }
 
     def blocked_fn(p):
         stats["calls"] += 1
@@ -603,8 +784,34 @@ def make_blocked_fn(bsp, *, voxel=64.0):
     # attach stats object to the function for external inspection
     blocked_fn._stats = stats
 
+    if verbose:
+        print(f"[blocked-fn] build completed in {stats['build_time']:.2f}s")
+
     return blocked_fn
 
+
+def _print_blocked_fn_progress(
+    brush_index,
+    brush_count,
+    blocking_aabbs,
+    skipped_nonblocking,
+    aabb_failed,
+    filter_time,
+    plane_time,
+    aabb_time,
+    start_time,
+    fast_aabb_count=0,
+    fallback_world_aabb_count=0,
+):
+    elapsed = time.perf_counter() - start_time
+    print(
+        "[blocked-fn] progress: "
+        f"brushes={brush_index}/{brush_count}, blocking_aabbs={blocking_aabbs}, "
+        f"skipped_nonblocking={skipped_nonblocking}, aabb_failed={aabb_failed}, "
+        f"elapsed={elapsed:.2f}s, filter_time={filter_time:.2f}s, "
+        f"plane_time={plane_time:.2f}s, aabb_time={aabb_time:.2f}s, "
+        f"fast_aabb={fast_aabb_count}, fallback_world_aabb={fallback_world_aabb_count}"
+    )
 
 def print_debug_cells(visited, world_mins, voxel):
     print("reachable cells:", len(visited))
@@ -658,3 +865,27 @@ def plot_visited_cells(visited, world_mins, voxel):
 #     print_debug_cells(visited, world_mins, VOXEL)
     # plot_visited_cells(visited, world_mins, VOXEL)
 
+
+
+"""
+NOTES
+
+5/25/2026 5:29pm
+
+I patched the broadphase AABB build so brushes over 32 sides use an O(n) axis-plane AABB instead of the cubic exact solver. For any large brush without usable axis planes, it falls back to world bounds, which is conservative for collision broadphase. I’m going to benchmark that exact BSP now.
+
+The benchmark is still slower than I want, which tells me even the “small” exact path is too costly across thousands of brushes. I’m going to broaden the fast path: try axis-plane AABBs first for every brush, and only use the exact solver if the brush doesn’t expose all three axis bounds.
+
+That did it: the same BSP now builds the blocked function in about 3.5 seconds, with AABB time down from minutes to 0.35s. All 9,601 blocking brushes on that map exposed axis bounds, so there was no world-bounds fallback needed. I’m doing a final cleanup pass and test run.
+
+Yep, the cause was the exact AABB reconstruction. Some brushes in that BSP have 180-262 sides, and the old code enumerated every 3-plane combination, which explodes fast.
+I changed mapindexer/flood_fill_volume.py (line 36) so brush AABBs use axis-aligned brush planes first, which is linear time. If a brush lacks axis bounds, small brushes still use the exact solver; large ones fall back to conservative world bounds so collision broadphase remains safe.
+On your ghzone-xxy_f43.bsp, the blocked-function build now completes in 3.49s instead of getting stuck for minutes:
+
+Yep, the cause was the exact AABB reconstruction. Some brushes in that BSP have 180-262 sides, and the old code enumerated every 3-plane combination, which explodes fast.
+
+I changed [mapindexer/flood_fill_volume.py](C:/repos/mapindexer/mapindexer/flood_fill_volume.py:36) so brush AABBs use axis-aligned brush planes first, which is linear time. If a brush lacks axis bounds, small brushes still use the exact solver; large ones fall back to conservative world bounds so collision broadphase remains safe.
+
+On your `ghzone-xxy_f43.bsp`, the blocked-function build now completes in `3.49s` instead of getting stuck for minutes:
+
+"""
